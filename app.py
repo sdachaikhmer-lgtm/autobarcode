@@ -48,6 +48,23 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
     if not file_name.lower().endswith('.jpg'):
         return ("ignored", None)
 
+    # Automatically move files missing '@' to Error_Files and remove them from source permanently
+    if "@" not in file_name:
+        error_folder = os.path.join(output_dir, "Error_Files")
+        os.makedirs(error_folder, exist_ok=True)
+        error_path = os.path.join(error_folder, file_name)
+        
+        try:
+            shutil.move(source_file_path, error_path)
+        except Exception:
+            shutil.copy2(source_file_path, error_path)
+            if os.path.exists(source_file_path):
+                try:
+                    os.remove(source_file_path)
+                except:
+                    pass
+        return ("error", f"Moved to Error_Files & Deleted from Source (Missing '@' format): {file_name}")
+
     # Silent file lock waiter
     max_lock_retries = 10
     for _ in range(max_lock_retries):
@@ -62,16 +79,28 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
         return ("ignored", None)
 
     try:
-        if "@" in file_name:
-            before_at, after_at = file_name.split("@", 1)
-            number_matches = re.findall(r'\d+', after_at)
-            if not number_matches:
-                number_matches = re.findall(r'\d+', file_name)
-        else:
+        before_at, after_at = file_name.split("@", 1)
+        number_matches = re.findall(r'\d+', after_at)
+        if not number_matches:
             number_matches = re.findall(r'\d+', file_name)
+            
+        container_unique_key = after_at.strip().split('.')[0].upper()
 
         if not number_matches:
-            return ("error", f"Error with {file_name}: No numbers found in filename")
+            error_folder = os.path.join(output_dir, "Error_Files")
+            os.makedirs(error_folder, exist_ok=True)
+            error_path = os.path.join(error_folder, file_name)
+            
+            try:
+                shutil.move(source_file_path, error_path)
+            except Exception:
+                shutil.copy2(source_file_path, error_path)
+                if os.path.exists(source_file_path):
+                    try:
+                        os.remove(source_file_path)
+                    except:
+                        pass
+            return ("error", f"Moved to Error_Files & Deleted from Source (No numbers found): {file_name}")
 
         barcode_text = number_matches[0]
 
@@ -98,13 +127,14 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
                 mismatch_folder = os.path.join(output_dir, "Unverified_Registers")
                 os.makedirs(mismatch_folder, exist_ok=True)
                 mismatch_path = os.path.join(mismatch_folder, file_name)
+                
                 if copy_only:
                     shutil.copy2(source_file_path, mismatch_path)
                 else:
                     shutil.move(source_file_path, mismatch_path)
                 return ("unverified", f"Skipped (Verify Mismatch): Moved to Unverified_Registers | {file_name}")
 
-            # Check duplicates strictly by REGISTER number
+            # Check duplicates strictly by REGISTER number in verify mode
             if seen_containers is not None and first_seen_files is not None:
                 with duplicate_lock:
                     if matched_reg in seen_containers:
@@ -143,7 +173,7 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
             # --- CONTAINER-ONLY MODE DUPLICATE CHECK ---
             if seen_containers is not None and first_seen_files is not None:
                 with duplicate_lock:
-                    if barcode_text in seen_containers:
+                    if container_unique_key in seen_containers:
                         dup_folder = os.path.join(output_dir, "Duplicate_containers")
                         os.makedirs(dup_folder, exist_ok=True)
                         dup_file_path = os.path.join(dup_folder, file_name)
@@ -154,12 +184,12 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
                             with open(report_path, mode='a', newline='', encoding='utf-8') as f:
                                 writer = csv.writer(f)
                                 if not file_exists: 
-                                    writer.writerow(["Timestamp", "Duplicate File", "Container Number", "Original File"])
+                                    writer.writerow(["Timestamp", "Duplicate File", "Container Identifier", "Original File"])
                                 writer.writerow([
                                     datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
                                     file_name, 
-                                    barcode_text, 
-                                    first_seen_files.get(barcode_text, "Unknown")
+                                    container_unique_key, 
+                                    first_seen_files.get(container_unique_key, "Unknown")
                                 ])
                         except PermissionError:
                             pass 
@@ -169,11 +199,11 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
                         else:
                             shutil.move(source_file_path, dup_file_path)
                         
-                        return ("duplicate_container", f"Skipped Duplicate Container ({barcode_text}): Moved to Duplicate_containers | {file_name}")
+                        return ("duplicate_container", f"Skipped Duplicate Container ({container_unique_key}): Moved to Duplicate_containers | {file_name}")
                     else:
-                        seen_containers.add(barcode_text)
-                        if barcode_text not in first_seen_files:
-                            first_seen_files[barcode_text] = file_name
+                        seen_containers.add(container_unique_key)
+                        if container_unique_key not in first_seen_files:
+                            first_seen_files[container_unique_key] = file_name
 
         # --- CHECK IF OUTPUT FILE ALREADY EXISTS ---
         output_file_path = os.path.join(output_dir, file_name)
@@ -186,7 +216,7 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
                     pass
             return ("output_existing", None)
 
-        # --- STAMPING & BARCODE LOGIC (Always from Container List source file) ---
+        # --- STAMPING & BARCODE LOGIC ---
         only_digits = "".join(filter(str.isdigit, barcode_text))
         last_two = int(only_digits[-2:]) if len(only_digits) >= 2 else 0
         calculated_angle = last_two + 180 if last_two % 2 == 0 else last_two + 190
@@ -234,7 +264,6 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
             
             max_text_width = base_width - 200
             
-            # PRINT BOTH DISTINCTLY: Verify source filename AND Container list filename (only if they are different)
             if verify_mode and matched_main_filename and matched_main_filename != file_name:
                 text_to_print = f"{matched_main_filename}\n{file_name}"
             else:
@@ -277,7 +306,20 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
         return ("processed", f"{action_label}: {file_name} | Barcode: {barcode_text}")
         
     except Exception as e:
-        return ("error", f"Error with {file_name}: {e}")
+        # Automatically catch corrupted files, PIL errors, or unreadable formats, move them to Error_Files, and remove from source
+        try:
+            error_folder = os.path.join(output_dir, "Error_Files")
+            os.makedirs(error_folder, exist_ok=True)
+            error_path = os.path.join(error_folder, file_name)
+            if os.path.exists(source_file_path):
+                shutil.move(source_file_path, error_path)
+        except Exception:
+            if os.path.exists(source_file_path):
+                try:
+                    os.remove(source_file_path)
+                except:
+                    pass
+        return ("error", f"Moved Corrupted/Error File to Error_Files: {file_name} | Reason: {e}")
 
 class BarcodeApp:
     def __init__(self, root):
@@ -614,7 +656,7 @@ class BarcodeApp:
                     if not os.path.exists(report_path):
                         with open(report_path, mode='w', newline='', encoding='utf-8') as f:
                             writer = csv.writer(f)
-                            writer.writerow(["Timestamp", "Duplicate File", "Container Number", "Original File"])
+                            writer.writerow(["Timestamp", "Duplicate File", "Container Identifier", "Original File"])
 
                     files = [f for f in os.listdir(source_dir) if f.lower().endswith('.jpg')]
                     for file_name in files:
@@ -846,7 +888,7 @@ class BarcodeApp:
                 if not os.path.exists(report_path):
                     with open(report_path, mode='w', newline='', encoding='utf-8') as f:
                         writer = csv.writer(f)
-                        writer.writerow(["Timestamp", "Duplicate File", "Container Number", "Original File"])
+                        writer.writerow(["Timestamp", "Duplicate File", "Container Identifier", "Original File"])
             except PermissionError:
                 messagebox.showerror("Excel File Locked", "Please close Excel / duplicates_report.csv before starting the app!")
                 return
@@ -1013,13 +1055,15 @@ class BarcodeApp:
             os.makedirs(target_dir, exist_ok=True)
             os.makedirs(os.path.join(target_dir, "list_of_container"), exist_ok=True)
             dup_folder = os.path.join(target_dir, "Duplicate_containers")
+            err_folder = os.path.join(target_dir, "Error_Files")
             os.makedirs(dup_folder, exist_ok=True)
+            os.makedirs(err_folder, exist_ok=True)
             
             report_path = os.path.join(dup_folder, "duplicates_report.csv")
             if not os.path.exists(report_path):
                 with open(report_path, mode='w', newline='', encoding='utf-8') as f:
                     writer = csv.writer(f)
-                    writer.writerow(["Timestamp", "Duplicate File", "Container Number", "Original File"])
+                    writer.writerow(["Timestamp", "Duplicate File", "Container Identifier", "Original File"])
 
             messagebox.showinfo("Success", f"Folder and subfolders created successfully:\n{target_dir}")
         except Exception as e:
@@ -1079,14 +1123,16 @@ class BarcodeApp:
             os.makedirs(self.session_output_dir, exist_ok=True)
             os.makedirs(os.path.join(self.session_output_dir, "list_of_container"), exist_ok=True)
             dup_folder = os.path.join(self.session_output_dir, "Duplicate_containers")
+            err_folder = os.path.join(self.session_output_dir, "Error_Files")
             os.makedirs(dup_folder, exist_ok=True)
+            os.makedirs(err_folder, exist_ok=True)
             
             report_path = os.path.join(dup_folder, "duplicates_report.csv")
             try:
                 if not os.path.exists(report_path):
                     with open(report_path, mode='w', newline='', encoding='utf-8') as f:
                         writer = csv.writer(f)
-                        writer.writerow(["Timestamp", "Duplicate File", "Container Number", "Original File"])
+                        writer.writerow(["Timestamp", "Duplicate File", "Container Identifier", "Original File"])
             except PermissionError:
                 messagebox.showerror("Excel File Locked", "Please close Excel / duplicates_report.csv before starting the app!")
                 return
@@ -1118,6 +1164,7 @@ class BarcodeApp:
                     os.makedirs(self.session_output_dir, exist_ok=True)
                     os.makedirs(os.path.join(self.session_output_dir, "list_of_container"), exist_ok=True)
                     os.makedirs(os.path.join(self.session_output_dir, "Duplicate_containers"), exist_ok=True)
+                    os.makedirs(os.path.join(self.session_output_dir, "Error_Files"), exist_ok=True)
                     
                     all_files = [f for f in os.listdir(source_dir) if f.lower().endswith('.jpg')]
                     container_files = [f for f in all_files if f not in self.processed_source_files]
