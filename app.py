@@ -1210,7 +1210,7 @@ class BarcodeApp:
             self.process_copy_btn.config(text="Stop Auto-Copy & Process", bg="#c0392b")
             self.log_box.insert(tk.END, f"Auto-Copy & Process started (Keep Source). Output: {target_output_dir}\n")
             self.log_box.see(tk.END)
-
+#44444
             self.toggle_processing_mode_silent()
             threading.Thread(target=self.copy_processing_loop_worker, daemon=True).start()
         else:
