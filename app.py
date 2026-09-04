@@ -3,8 +3,9 @@ import re
 import datetime
 import csv
 import shutil
+import json
 import tkinter as tk
-from tkinter import filedialog, scrolledtext, messagebox, simpledialog
+from tkinter import filedialog, scrolledtext, messagebox, simpledialog, ttk
 from PIL import Image, ImageOps, ImageDraw, ImageFont, ImageEnhance
 import requests
 from io import BytesIO
@@ -14,7 +15,31 @@ import threading
 import subprocess
 import gspread
 
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+
+SCOPES = ['https://www.googleapis.com/auth/drive']
+
 duplicate_lock = threading.Lock()
+CONFIG_FILE = "app_config.json"
+TARGET_PARENT_FOLDER_ID = "1sTeOcK79ytlePV0zF84zFKA2Q52t82pT"
+
+def save_config(data):
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+def load_config():
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
 
 def draw_wrapped_text(draw, text, font, max_width):
     lines = []
@@ -41,42 +66,85 @@ def draw_wrapped_text(draw, text, font, max_width):
     if current_line: lines.append(current_line)
     return lines
 
+def is_file_ready(file_path):
+    if not os.path.exists(file_path):
+        return False
+    try:
+        size1 = os.path.getsize(file_path)
+        if size1 <= 0:
+            return False
+        time.sleep(0.2)
+        size2 = os.path.getsize(file_path)
+        if size1 != size2:
+            return False
+
+        with open(file_path, 'ab'):
+            pass
+        return True
+    except Exception:
+        return False
+
+def log_error_to_file(error_msg):
+    try:
+        with open("error_log.txt", "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {error_msg}\n")
+    except Exception:
+        pass
+
+def get_today_active_date_folder():
+    today_str = datetime.datetime.now().strftime("%d-%b-%Y")
+    return rf"D:\Scan\Main OutputFastOCR\OutputFastOCR_{today_str}"
+
 def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=False, seen_containers=None, first_seen_files=None, verify_mode=False, register_numbers=None):
     source_file_path = os.path.join(source_dir, file_name)
     output_file_path = os.path.join(output_dir, file_name)
     
-    if not file_name.lower().endswith('.jpg'):
+    for _ in range(10):
+        if is_file_ready(source_file_path):
+            break
+        time.sleep(0.3)
+    else:
         return ("ignored", None)
 
-    # Automatically move files missing '@' to Error_Files and remove them from source permanently
-    if "@" not in file_name:
+    is_image = file_name.lower().endswith(('.jpg', '.jpeg', '.png'))
+    if not is_image:
+        try:
+            if os.path.exists(source_file_path):
+                if copy_only:
+                    shutil.copy2(source_file_path, output_file_path)
+                else:
+                    shutil.move(source_file_path, output_file_path)
+                return ("processed", f"Passed Non-Image File: {file_name}")
+        except Exception as e:
+            err_str = f"Error passing file {file_name}: {e}"
+            log_error_to_file(err_str)
+            return ("error", err_str)
+        return ("ignored", None)
+
+    def force_move_to_error():
         error_folder = os.path.join(output_dir, "Error_Files")
         os.makedirs(error_folder, exist_ok=True)
         error_path = os.path.join(error_folder, file_name)
-        
-        try:
-            shutil.move(source_file_path, error_path)
-        except Exception:
-            shutil.copy2(source_file_path, error_path)
-            if os.path.exists(source_file_path):
+        for _ in range(3):
+            try:
+                if os.path.exists(source_file_path):
+                    shutil.move(source_file_path, error_path)
+                    return True
+            except Exception:
                 try:
-                    os.remove(source_file_path)
-                except:
-                    pass
-        return ("error", f"Moved to Error_Files & Deleted from Source (Missing '@' format): {file_name}")
+                    shutil.copy2(source_file_path, error_path)
+                    if os.path.exists(source_file_path):
+                        os.remove(source_file_path)
+                    return True
+                except Exception:
+                    time.sleep(0.3)
+        return False
 
-    # Silent file lock waiter
-    max_lock_retries = 10
-    for _ in range(max_lock_retries):
-        try:
-            if os.path.exists(source_file_path):
-                with open(source_file_path, 'rb'):
-                    pass
-            break
-        except (PermissionError, IOError):
-            time.sleep(0.3)
-    else:
-        return ("ignored", None)
+    if "@" not in file_name:
+        force_move_to_error()
+        err_str = f"Moved Unidentified File to Error_Files (Missing '@'): {file_name}"
+        log_error_to_file(err_str)
+        return ("error", err_str)
 
     try:
         before_at, after_at = file_name.split("@", 1)
@@ -87,24 +155,12 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
         container_unique_key = after_at.strip().split('.')[0].upper()
 
         if not number_matches:
-            error_folder = os.path.join(output_dir, "Error_Files")
-            os.makedirs(error_folder, exist_ok=True)
-            error_path = os.path.join(error_folder, file_name)
-            
-            try:
-                shutil.move(source_file_path, error_path)
-            except Exception:
-                shutil.copy2(source_file_path, error_path)
-                if os.path.exists(source_file_path):
-                    try:
-                        os.remove(source_file_path)
-                    except:
-                        pass
-            return ("error", f"Moved to Error_Files & Deleted from Source (No numbers found): {file_name}")
+            force_move_to_error()
+            err_str = f"Moved Unidentified File to Error_Files (No numbers): {file_name}"
+            log_error_to_file(err_str)
+            return ("error", err_str)
 
         barcode_text = number_matches[0]
-
-        # --- VERIFY MODE LOGIC ---
         matched_main_filename = None
 
         if verify_mode:
@@ -127,14 +183,12 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
                 mismatch_folder = os.path.join(output_dir, "Unverified_Registers")
                 os.makedirs(mismatch_folder, exist_ok=True)
                 mismatch_path = os.path.join(mismatch_folder, file_name)
-                
                 if copy_only:
                     shutil.copy2(source_file_path, mismatch_path)
                 else:
                     shutil.move(source_file_path, mismatch_path)
                 return ("unverified", f"Skipped (Verify Mismatch): Moved to Unverified_Registers | {file_name}")
 
-            # Check duplicates strictly by REGISTER number in verify mode
             if seen_containers is not None and first_seen_files is not None:
                 with duplicate_lock:
                     if matched_reg in seen_containers:
@@ -142,7 +196,6 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
                         os.makedirs(dup_folder, exist_ok=True)
                         dup_file_path = os.path.join(dup_folder, file_name)
                         report_path = os.path.join(dup_folder, "duplicates_report.csv")
-                        
                         try:
                             file_exists = os.path.exists(report_path)
                             with open(report_path, mode='a', newline='', encoding='utf-8') as f:
@@ -155,22 +208,19 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
                                     matched_reg, 
                                     first_seen_files.get(matched_reg, "Unknown")
                                 ])
-                        except PermissionError:
-                            pass 
-                        
+                        except:
+                            pass
                         if copy_only:
                             shutil.copy2(source_file_path, dup_file_path)
                         else:
                             shutil.move(source_file_path, dup_file_path)
-                        
-                        return ("duplicate_container", f"Skipped Duplicate Register ({matched_reg}): Moved to Duplicate_containers | {file_name}")
+                        return ("duplicate_container", f"Skipped Duplicate Register ({matched_reg}) | {file_name}")
                     else:
                         seen_containers.add(matched_reg)
                         if matched_reg not in first_seen_files:
                             first_seen_files[matched_reg] = file_name
 
         else:
-            # --- CONTAINER-ONLY MODE DUPLICATE CHECK ---
             if seen_containers is not None and first_seen_files is not None:
                 with duplicate_lock:
                     if container_unique_key in seen_containers:
@@ -178,7 +228,6 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
                         os.makedirs(dup_folder, exist_ok=True)
                         dup_file_path = os.path.join(dup_folder, file_name)
                         report_path = os.path.join(dup_folder, "duplicates_report.csv")
-                        
                         try:
                             file_exists = os.path.exists(report_path)
                             with open(report_path, mode='a', newline='', encoding='utf-8') as f:
@@ -191,23 +240,19 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
                                     container_unique_key, 
                                     first_seen_files.get(container_unique_key, "Unknown")
                                 ])
-                        except PermissionError:
-                            pass 
-                        
+                        except:
+                            pass
                         if copy_only:
                             shutil.copy2(source_file_path, dup_file_path)
                         else:
                             shutil.move(source_file_path, dup_file_path)
-                        
-                        return ("duplicate_container", f"Skipped Duplicate Container ({container_unique_key}): Moved to Duplicate_containers | {file_name}")
+                        return ("duplicate_container", f"Skipped Duplicate Container ({container_unique_key}) | {file_name}")
                     else:
                         seen_containers.add(container_unique_key)
                         if container_unique_key not in first_seen_files:
                             first_seen_files[container_unique_key] = file_name
 
-        # --- CHECK IF OUTPUT FILE ALREADY EXISTS ---
         output_file_path = os.path.join(output_dir, file_name)
-
         if os.path.exists(output_file_path):
             if not copy_only and os.path.exists(source_file_path):
                 try:
@@ -216,7 +261,6 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
                     pass
             return ("output_existing", None)
 
-        # --- STAMPING & BARCODE LOGIC ---
         only_digits = "".join(filter(str.isdigit, barcode_text))
         last_two = int(only_digits[-2:]) if len(only_digits) >= 2 else 0
         calculated_angle = last_two + 180 if last_two % 2 == 0 else last_two + 190
@@ -232,14 +276,17 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
         response = requests.get(barcode_url, timeout=3)
         
         if response.status_code != 200:
-            return ("error", f"Error with {file_name}: API error code {response.status_code}")
+            force_move_to_error()
+            err_str = f"Error with {file_name}: API error code {response.status_code}"
+            log_error_to_file(err_str)
+            return ("error", err_str)
 
         barcode_img = Image.open(BytesIO(response.content)).convert("RGBA")
         barcode_img = barcode_img.resize((1000, 250))
         
         gray_barcode = ImageOps.grayscale(barcode_img)
-        green_barcode = Image.new("RGBA", barcode_img.size, (0, 150, 0, 255))
-        barcode_img = Image.composite(green_barcode, Image.new("RGBA", barcode_img.size, (255, 255, 255, 0)), ImageOps.invert(gray_barcode))
+        green_badge = Image.new("RGBA", barcode_img.size, (0, 150, 0, 255))
+        barcode_img = Image.composite(green_badge, Image.new("RGBA", barcode_img.size, (255, 255, 255, 0)), ImageOps.invert(gray_barcode))
 
         spacing = 35  
         draw = ImageDraw.Draw(base_img)
@@ -263,11 +310,7 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
             time_height = time_bbox[3] - time_bbox[1]
             
             max_text_width = base_width - 200
-            
-            if verify_mode and matched_main_filename and matched_main_filename != file_name:
-                text_to_print = f"{matched_main_filename}\n{file_name}"
-            else:
-                text_to_print = file_name
+            text_to_print = file_name
                 
             filename_lines = draw_wrapped_text(draw, text_to_print, font, max_text_width)
             
@@ -298,40 +341,35 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
         
         if not copy_only and os.path.exists(source_file_path):
             try:
-                os.remove(source_file_path)
+                archive_dir = os.path.join(source_dir, "Processed_Backup")
+                os.makedirs(archive_dir, exist_ok=True)
+                shutil.move(source_file_path, os.path.join(archive_dir, file_name))
             except:
-                pass
+                try:
+                    os.remove(source_file_path)
+                except:
+                    pass
         
         action_label = "Copied & Processed" if copy_only else "Success & Moved"
         return ("processed", f"{action_label}: {file_name} | Barcode: {barcode_text}")
         
     except Exception as e:
-        # Automatically catch corrupted files, PIL errors, or unreadable formats, move them to Error_Files, and remove from source
-        try:
-            error_folder = os.path.join(output_dir, "Error_Files")
-            os.makedirs(error_folder, exist_ok=True)
-            error_path = os.path.join(error_folder, file_name)
-            if os.path.exists(source_file_path):
-                shutil.move(source_file_path, error_path)
-        except Exception:
-            if os.path.exists(source_file_path):
-                try:
-                    os.remove(source_file_path)
-                except:
-                    pass
-        return ("error", f"Moved Corrupted/Error File to Error_Files: {file_name} | Reason: {e}")
+        force_move_to_error()
+        err_str = f"Moved Stuck/Corrupted File to Error_Files: {file_name} | Reason: {e}"
+        log_error_to_file(err_str)
+        return ("error", err_str)
 
 class BarcodeApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("High-Speed Move-Processing Barcode App")
-        self.root.geometry("980x1850")
+        self.root.title("High-Speed Scrollable Barcode App")
+        self.root.geometry("1020x840")
         self.root.configure(bg="#f4f6f7")
         
         self.is_watching = False
         self.is_copy_processing = False  
-        self.is_sheet_sync_looping = False  
         self.is_list_copy_looping = False  
+        self.is_gdrive_folder_sync_looping = False  
         self.current_font_size = 11  
         self.session_output_dir = "" 
         self.is_log_expanded = False
@@ -339,7 +377,6 @@ class BarcodeApp:
         self.verify_mode_active = False 
         self.register_numbers_set = {} 
         
-        self.target_sheets = ["report"]
         self.seen_containers = set()
         self.first_seen_files = {}  
         self.processed_source_files = set()
@@ -348,11 +385,42 @@ class BarcodeApp:
         self.count_already_stamped = 0
         self.count_files_move = 0
         self.count_errors = 0
+
+        self.config_data = load_config()
         
-        self.main_frame = tk.Frame(root, bg="#f4f6f7")
-        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        container_outer = tk.Frame(root, bg="#f4f6f7")
+        container_outer.pack(fill=tk.BOTH, expand=True)
+
+        self.canvas = tk.Canvas(container_outer, bg="#f4f6f7", highlightthickness=0)
+        self.scrollbar = tk.Scrollbar(container_outer, orient=tk.VERTICAL, command=self.canvas.yview)
         
-        top_control_frame = tk.Frame(self.main_frame, bg="#f4f6f7")
+        self.main_frame = tk.Frame(self.canvas, bg="#f4f6f7")
+        
+        self.main_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+        
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.main_frame, anchor="nw")
+        
+        self.canvas.bind(
+            "<Configure>",
+            lambda e: self.canvas.itemconfig(self.canvas_window, width=e.width)
+        )
+
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _on_mousewheel(event):
+            self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
+        inner_pad = tk.Frame(self.main_frame, bg="#f4f6f7")
+        inner_pad.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+        top_control_frame = tk.Frame(inner_pad, bg="#f4f6f7")
         top_control_frame.pack(fill=tk.X, pady=(0, 10))
         
         left_ctrls = tk.Frame(top_control_frame, bg="#f4f6f7")
@@ -376,8 +444,7 @@ class BarcodeApp:
         self.zoom_in_btn = tk.Button(zoom_frame, text=" 🔍+ ", font=("Arial", 10, "bold"), width=3, command=self.zoom_in)
         self.zoom_in_btn.pack(side=tk.LEFT, padx=2)
 
-        # --- MODE SWITCH & VERIFY CONFIG BAR ---
-        mode_card = tk.LabelFrame(self.main_frame, text=" Processing Mode & Verify Configuration ", bg="#ffffff", fg="#2c3e50", font=("Arial", 10, "bold"), padx=15, pady=10)
+        mode_card = tk.LabelFrame(inner_pad, text=" Processing Mode & Verify Configuration ", bg="#ffffff", fg="#2c3e50", font=("Arial", 10, "bold"), padx=15, pady=10)
         mode_card.pack(fill=tk.X, pady=(0, 12))
 
         mode_top_frame = tk.Frame(mode_card, bg="#ffffff")
@@ -389,12 +456,15 @@ class BarcodeApp:
         self.mode_toggle_btn = tk.Button(mode_top_frame, text=" 🔀 Switch to Verify Mode ", bg="#2980b9", fg="white", font=("Arial", 10, "bold"), relief=tk.FLAT, padx=12, pady=5, command=self.toggle_processing_mode)
         self.mode_toggle_btn.pack(side=tk.RIGHT, padx=5)
 
+        today_base_folder = get_today_active_date_folder()
+        default_verify_path = os.path.join(today_base_folder, "Main")
+        default_container_path = os.path.join(today_base_folder, "Container List")
+        default_output_nested = os.path.join(today_base_folder, "BarcodeandStamp")
+        default_gdrive_src = today_base_folder
+
         tk.Label(mode_card, text="Verify Source Location (Main Folder with 'M' filenames):", bg="#ffffff", font=("Arial", self.current_font_size, "bold")).pack(anchor="w", pady=(8, 0))
         verify_src_inner = tk.Frame(mode_card, bg="#ffffff")
         verify_src_inner.pack(fill=tk.X, pady=3)
-
-        today_date_str = datetime.datetime.now().strftime("%d-%b-%Y")
-        default_verify_path = rf"D:\Scan\Main OutputFastOCR\OutputFastOCR_{today_date_str}\Main"
 
         self.verify_entry = tk.Entry(verify_src_inner, font=("Arial", self.current_font_size), relief=tk.SOLID, bd=1)
         self.verify_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4, padx=(0, 8))
@@ -403,8 +473,7 @@ class BarcodeApp:
         self.btn_verify_src = tk.Button(verify_src_inner, text="Browse...", font=("Arial", self.current_font_size), bg="#ecf0f1", command=self.select_verify_source)
         self.btn_verify_src.pack(side=tk.RIGHT)
 
-        # --- STATS HEADER ---
-        self.stats_frame = tk.Frame(self.main_frame, bg="#2c3e50", relief=tk.FLAT, bd=0)
+        self.stats_frame = tk.Frame(inner_pad, bg="#2c3e50", relief=tk.FLAT, bd=0)
         self.stats_frame.pack(fill=tk.X, pady=(0, 15))
         
         stats_inner = tk.Frame(self.stats_frame, bg="#2c3e50")
@@ -423,10 +492,10 @@ class BarcodeApp:
         )
         self.stats_lbl.pack(side=tk.LEFT)
 
-        # --- SOURCE FOLDER ---
-        default_container_path = rf"D:\Scan\Main OutputFastOCR\OutputFastOCR_{today_date_str}\Container List"
+        self.progress_bar = ttk.Progressbar(inner_pad, orient="horizontal", mode="determinate")
+        self.progress_bar.pack(fill=tk.X, pady=(0, 12))
 
-        self.src_card = tk.LabelFrame(self.main_frame, text=" Source Configuration ", bg="#ffffff", fg="#2c3e50", font=("Arial", 10, "bold"), padx=15, pady=10)
+        self.src_card = tk.LabelFrame(inner_pad, text=" Source Configuration ", bg="#ffffff", fg="#2c3e50", font=("Arial", 10, "bold"), padx=15, pady=10)
         self.src_card.pack(fill=tk.X, pady=(0, 12))
 
         tk.Label(self.src_card, text="Source Folder (Container List):", bg="#ffffff", font=("Arial", self.current_font_size, "bold")).pack(anchor="w", pady=(2, 0))
@@ -440,8 +509,9 @@ class BarcodeApp:
         self.btn_src = tk.Button(src_inner, text="Browse...", font=("Arial", self.current_font_size), bg="#ecf0f1", command=self.select_source)
         self.btn_src.pack(side=tk.RIGHT)
 
-        # --- STAMP FILE SECTION ---
-        self.stamp_card = tk.LabelFrame(self.main_frame, text=" Stamp Image Configuration ", bg="#ffffff", fg="#2c3e50", font=("Arial", 10, "bold"), padx=15, pady=10)
+        default_stamp_path = self.config_data.get("stamp_path", r"D:\barcodestame\new 2 stamp RB.png")
+
+        self.stamp_card = tk.LabelFrame(inner_pad, text=" Stamp Image Configuration ", bg="#ffffff", fg="#2c3e50", font=("Arial", 10, "bold"), padx=15, pady=10)
         self.stamp_card.pack(fill=tk.X, pady=(0, 12))
 
         self.lbl2 = tk.Label(self.stamp_card, text="Fixed Stamp File Path (.png):", bg="#ffffff", font=("Arial", self.current_font_size, "bold"))
@@ -452,15 +522,12 @@ class BarcodeApp:
         
         self.fixed_entry = tk.Entry(stamp_inner, font=("Arial", self.current_font_size), relief=tk.SOLID, bd=1)
         self.fixed_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4, padx=(0, 8))
-        self.fixed_entry.insert(0, r"D:\barcodestame\new 2 stamp RB.png")
+        self.fixed_entry.insert(0, default_stamp_path)
         
         self.btn_fx = tk.Button(stamp_inner, text="Browse...", font=("Arial", self.current_font_size), bg="#ecf0f1", command=self.select_fixed_file)
         self.btn_fx.pack(side=tk.RIGHT)
 
-        # --- OUTPUT DESTINATION SECTION ---
-        default_output_nested = rf"D:\Scan\Main OutputFastOCR\OutputFastOCR_{today_date_str}\BarcodeandStamp"
-
-        self.out_card = tk.LabelFrame(self.main_frame, text=" Output Destination Configuration ", bg="#ffffff", fg="#2c3e50", font=("Arial", 10, "bold"), padx=15, pady=10)
+        self.out_card = tk.LabelFrame(inner_pad, text=" Output Destination Configuration ", bg="#ffffff", fg="#2c3e50", font=("Arial", 10, "bold"), padx=15, pady=10)
         self.out_card.pack(fill=tk.X, pady=(0, 12))
 
         self.lbl3 = tk.Label(self.out_card, text="Output Directory:", bg="#ffffff", font=("Arial", self.current_font_size, "bold"))
@@ -483,71 +550,45 @@ class BarcodeApp:
         self.auto_create_out_btn.pack(side=tk.LEFT, padx=(0, 8))
 
         self.open_folder_btn = tk.Button(output_ctrl_frame, text=" 📂 Open Output Folder ", bg="#3498db", fg="white", font=("Arial", 10, "bold"), relief=tk.FLAT, padx=12, pady=6, command=self.open_current_output_folder)
-        self.open_folder_btn.pack(side=tk.LEFT)
-
-        self.open_report_btn = tk.Button(output_ctrl_frame, text=" 📊 Open Report CSV ", bg="#e67e22", fg="white", font=("Arial", 10, "bold"), relief=tk.FLAT, padx=10, pady=6, command=self.open_duplicates_report)
-        self.open_report_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.open_folder_btn.pack(side=tk.LEFT, padx=(0, 8))
 
         self.toggle_list_copy_btn = tk.Button(output_ctrl_frame, text=" 🚀 Start Auto-Copy (list_of_container) ", bg="#8e44ad", fg="white", font=("Arial", 10, "bold"), relief=tk.FLAT, padx=10, pady=6, command=self.toggle_list_copy_loop)
-        self.toggle_list_copy_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.toggle_list_copy_btn.pack(side=tk.LEFT)
 
-        # --- GOOGLE SHEETS (data_seals) AUTO-SYNC CONFIGURATION ---
-        default_csv_path = rf"D:\Scan\Main OutputFastOCR\OutputFastOCR_{today_date_str}\Report\report.csv"
+        gdrive_card = tk.LabelFrame(inner_pad, text=" Google Drive OAuth Quota Sync -> Main Customs Docs (Sophal) ", bg="#ffffff", fg="#2c3e50", font=("Arial", 10, "bold"), padx=15, pady=10)
+        gdrive_card.pack(fill=tk.X, pady=(0, 12))
 
-        self.seal_card = tk.LabelFrame(self.main_frame, text=" Google Sheets (data_seals) Auto-Sync Configuration ", bg="#ffffff", fg="#2c3e50", font=("Arial", 10, "bold"), padx=15, pady=10)
-        self.seal_card.pack(fill=tk.X, pady=(0, 12))
-
-        self.lbl_seal_src = tk.Label(self.seal_card, text="Select Source CSV Report File:", bg="#ffffff", font=("Arial", self.current_font_size, "bold"))
-        self.lbl_seal_src.pack(anchor="w", pady=(2, 0))
-
-        seal_src_inner = tk.Frame(self.seal_card, bg="#ffffff")
-        seal_src_inner.pack(fill=tk.X, pady=3)
-
-        self.seal_src_entry = tk.Entry(seal_src_inner, font=("Arial", self.current_font_size), relief=tk.SOLID, bd=1)
-        self.seal_src_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4, padx=(0, 8))
-        self.seal_src_entry.insert(0, default_csv_path)
+        tk.Label(gdrive_card, text="Local Date Folder to Mirror (Updates automatically to today's date):", bg="#ffffff", font=("Arial", self.current_font_size, "bold")).pack(anchor="w", pady=(2, 0))
+        gd_src_inner = tk.Frame(gdrive_card, bg="#ffffff")
+        gd_src_inner.pack(fill=tk.X, pady=3)
         
-        self.btn_browse_seal_src = tk.Button(seal_src_inner, text="Browse Source...", font=("Arial", self.current_font_size), bg="#ecf0f1", command=self.select_source_seal_file)
-        self.btn_browse_seal_src.pack(side=tk.RIGHT)
-
-        sheet_mgmt_frame = tk.Frame(self.seal_card, bg="#ffffff")
-        sheet_mgmt_frame.pack(fill=tk.X, pady=(6, 2))
-
-        self.lbl_sheets_active = tk.Label(sheet_mgmt_frame, text="", bg="#ffffff", fg="#27ae60", font=("Arial", self.current_font_size, "bold"))
-        self.lbl_sheets_active.pack(side=tk.LEFT, anchor="w")
-
-        self.btn_manage_sheets = tk.Button(sheet_mgmt_frame, text=" ➕ Manage / Add Sheet Tabs ", bg="#2980b9", fg="white", font=("Arial", 9, "bold"), relief=tk.FLAT, padx=8, pady=4, command=self.open_sheet_manager_dialog)
-        self.btn_manage_sheets.pack(side=tk.RIGHT, padx=(0, 4))
-
-        self.btn_auto_mirror = tk.Button(sheet_mgmt_frame, text=" 🔄 Auto-Mirror Source Name ", bg="#8e44ad", fg="white", font=("Arial", 9, "bold"), relief=tk.FLAT, padx=8, pady=4, command=self.auto_mirror_source_sheet_name)
-        self.btn_auto_mirror.pack(side=tk.RIGHT, padx=(4, 0))
-
-        self.update_active_sheets_label()
-
-        sheet_sync_ctrl_frame = tk.Frame(self.seal_card, bg="#ffffff")
-        sheet_sync_ctrl_frame.pack(fill=tk.X, pady=(8, 4))
-
-        tk.Label(sheet_sync_ctrl_frame, text="Loop Interval (Sec):", bg="#ffffff", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=(0, 5))
+        self.gdrive_src_entry = tk.Entry(gd_src_inner, font=("Arial", self.current_font_size), relief=tk.SOLID, bd=1)
+        self.gdrive_src_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4, padx=(0, 8))
+        self.gdrive_src_entry.insert(0, default_gdrive_src)
         
-        self.sheet_interval_entry = tk.Entry(sheet_sync_ctrl_frame, font=("Arial", 10), width=5, relief=tk.SOLID, bd=1)
-        self.sheet_interval_entry.pack(side=tk.LEFT, padx=(0, 8))
-        self.sheet_interval_entry.insert(0, "30")
+        self.btn_gd_src = tk.Button(gd_src_inner, text="Browse...", font=("Arial", self.current_font_size), bg="#ecf0f1", command=self.select_gdrive_source)
+        self.btn_gd_src.pack(side=tk.RIGHT)
 
-        self.toggle_sheet_loop_btn = tk.Button(
-            sheet_sync_ctrl_frame, 
-            text=" ⏱️ Start Auto-Sync Loop ", 
-            bg="#27ae60", 
+        gdrive_ctrl_frame = tk.Frame(gdrive_card, bg="#ffffff")
+        gdrive_ctrl_frame.pack(fill=tk.X, pady=(8, 2))
+
+        self.auto_create_gdrive_btn = tk.Button(gdrive_ctrl_frame, text=" 📁 Auto-Create GDrive Folder & Log IDs ", bg="#27ae60", fg="white", font=("Arial", 10, "bold"), relief=tk.FLAT, padx=10, pady=6, command=self.manual_create_gdrive_folders)
+        self.auto_create_gdrive_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.toggle_gdrive_folder_sync_btn = tk.Button(
+            gdrive_ctrl_frame, 
+            text=" ☁️ Start Auto-Sync CustomsDocs ", 
+            bg="#8e44ad", 
             fg="white", 
             font=("Arial", 10, "bold"), 
             relief=tk.FLAT, 
             padx=10, 
             pady=6, 
-            command=self.toggle_sheet_sync_loop
+            command=self.toggle_gdrive_folder_sync_loop
         )
-        self.toggle_sheet_loop_btn.pack(side=tk.LEFT)
+        self.toggle_gdrive_folder_sync_btn.pack(side=tk.LEFT)
 
-        # --- ACTION BUTTONS CONTAINER ---
-        action_btns_frame = tk.Frame(self.main_frame, bg="#f4f6f7")
+        action_btns_frame = tk.Frame(inner_pad, bg="#f4f6f7")
         action_btns_frame.pack(fill=tk.X, pady=(0, 12))
 
         self.watch_btn = tk.Button(action_btns_frame, text="Start Auto-Watch & Process", bg="#27ae60", fg="white", font=("Arial", 11, "bold"), bd=0, relief=tk.FLAT, command=self.toggle_watch)
@@ -556,17 +597,92 @@ class BarcodeApp:
         self.process_copy_btn = tk.Button(action_btns_frame, text="Start Auto-Copy & Process (Keep Source)", bg="#d35400", fg="white", font=("Arial", 11, "bold"), bd=0, relief=tk.FLAT, command=self.toggle_copy_processing)
         self.process_copy_btn.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(5, 0), ipady=8)
 
-        # --- CONSOLE LOG BOX ---
-        self.log_box = scrolledtext.ScrolledText(self.main_frame, font=("Consolas", self.current_font_size), height=10, state="normal", relief=tk.SOLID, bd=1)
+        self.log_box = scrolledtext.ScrolledText(inner_pad, font=("Consolas", self.current_font_size), height=10, state="normal", relief=tk.SOLID, bd=1)
         self.log_box.pack(fill=tk.BOTH, expand=True)
 
         self.update_output_file_count()
 
+    def get_oauth_headers(self):
+        creds = None
+        token_path = "token.json"
+        client_secrets_path = r"D:\barcodestame\credentials.json"
+        
+        if os.path.exists(token_path):
+            creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(client_secrets_path, SCOPES)
+                creds = flow.run_local_server(port=0)
+            with open(token_path, 'w') as token:
+                token.write(creds.to_json())
+        return {"Authorization": f"Bearer {creds.token}"}
+
+    def save_current_paths(self):
+        cfg = {
+            "verify_path": self.verify_entry.get().strip(),
+            "source_path": self.source_entry.get().strip(),
+            "stamp_path": self.fixed_entry.get().strip(),
+            "output_path": self.output_entry.get().strip(),
+            "gdrive_src": self.gdrive_src_entry.get().strip()
+        }
+        save_config(cfg)
+
+    def select_source(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.source_entry.delete(0, tk.END)
+            self.source_entry.insert(0, folder)
+            self.save_current_paths()
+
     def select_verify_source(self):
-        path = filedialog.askdirectory()
-        if path:
+        folder = filedialog.askdirectory()
+        if folder:
             self.verify_entry.delete(0, tk.END)
-            self.verify_entry.insert(0, path)
+            self.verify_entry.insert(0, folder)
+            self.save_current_paths()
+
+    def select_gdrive_source(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.gdrive_src_entry.delete(0, tk.END)
+            self.gdrive_src_entry.insert(0, folder)
+            self.save_current_paths()
+
+    def select_fixed_file(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Image Files", "*.png;*.jpg;*.jpeg")])
+        if file_path:
+            self.fixed_entry.delete(0, tk.END)
+            self.fixed_entry.insert(0, file_path)
+            self.save_current_paths()
+
+    def select_output(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.output_entry.delete(0, tk.END)
+            self.output_entry.insert(0, folder)
+            self.save_current_paths()
+
+    def update_output_file_count(self):
+        out_dir = self.output_entry.get().strip()
+        if out_dir and os.path.exists(out_dir):
+            try:
+                files_list = [f for f in os.listdir(out_dir) if os.path.isfile(os.path.join(out_dir, f))]
+                self.count_files_move = len(files_list)
+            except Exception:
+                self.count_files_move = 0
+        else:
+            self.count_files_move = 0
+        self.update_stats_display()
+
+    def open_current_output_folder(self):
+        target_dir = self.output_entry.get()
+        if target_dir and os.path.exists(target_dir):
+            os.makedirs(target_dir, exist_ok=True)
+            subprocess.Popen(f'explorer "{os.path.abspath(target_dir)}"')
+        else:
+            messagebox.showinfo("Folder Notice", "The output folder path does not exist yet.")
 
     def toggle_processing_mode(self):
         if not self.verify_mode_active:
@@ -607,26 +723,6 @@ class BarcodeApp:
         except Exception:
             pass
 
-    def update_output_file_count(self):
-        out_dir = self.output_entry.get().strip()
-        if out_dir and os.path.exists(out_dir):
-            try:
-                files_list = [f for f in os.listdir(out_dir) if os.path.isfile(os.path.join(out_dir, f))]
-                self.count_files_move = len(files_list)
-            except Exception:
-                self.count_files_move = 0
-        else:
-            self.count_files_move = 0
-        self.update_stats_display()
-
-    def open_duplicates_report(self):
-        target_dir = self.output_entry.get().strip()
-        report_path = os.path.join(target_dir, "Duplicate_containers", "duplicates_report.csv")
-        if os.path.exists(report_path):
-            subprocess.Popen(f'excel "{os.path.abspath(report_path)}"' if os.name == 'nt' else f'open "{os.path.abspath(report_path)}"')
-        else:
-            messagebox.showinfo("Report Notice", "The duplicates report CSV file does not exist yet (no duplicates processed yet).")
-
     def toggle_list_copy_loop(self):
         if not self.is_list_copy_looping:
             self.is_list_copy_looping = True
@@ -646,309 +742,306 @@ class BarcodeApp:
                 source_dir = self.source_entry.get().strip()
                 output_dir = self.output_entry.get().strip()
                 
-                if source_dir and output_dir and os.path.exists(output_dir) and os.path.exists(source_dir):
+                if source_dir and output_dir and os.path.exists(source_dir):
                     target_list_dir = os.path.join(output_dir, "list_of_container")
-                    dup_folder = os.path.join(output_dir, "Duplicate_containers")
                     os.makedirs(target_list_dir, exist_ok=True)
-                    os.makedirs(dup_folder, exist_ok=True)
-                    
-                    report_path = os.path.join(dup_folder, "duplicates_report.csv")
-                    if not os.path.exists(report_path):
-                        with open(report_path, mode='w', newline='', encoding='utf-8') as f:
-                            writer = csv.writer(f)
-                            writer.writerow(["Timestamp", "Duplicate File", "Container Identifier", "Original File"])
-
-                    files = [f for f in os.listdir(source_dir) if f.lower().endswith('.jpg')]
+                    files = os.listdir(source_dir)
                     for file_name in files:
+                        if not self.is_list_copy_looping:
+                            break
                         src_file_path = os.path.join(source_dir, file_name)
                         dest_file_path = os.path.join(target_list_dir, file_name)
-                        if not os.path.exists(dest_file_path):
-                            shutil.copy2(src_file_path, dest_file_path)
+                        
+                        if os.path.isfile(src_file_path) and not os.path.exists(dest_file_path):
+                            if is_file_ready(src_file_path) and not os.path.exists(dest_file_path):
+                                try:
+                                    shutil.copy2(src_file_path, dest_file_path)
+                                except Exception:
+                                    pass
             except Exception:
                 pass
             time.sleep(0.5)
 
-    def auto_mirror_source_sheet_name(self):
-        src_file = self.seal_src_entry.get()
-        if not src_file:
-            messagebox.showwarning("Warning", "Please select a source CSV file first.")
-            return
+    def get_or_create_folder_id(self, headers, parent_id, folder_name):
+        url = "https://www.googleapis.com/drive/v3/files"
+        params = {
+            "q": f"'{parent_id}' in parents and name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+            "pageSize": 1,
+            "fields": "files(id, name)",
+            "supportsAllDrives": True,
+            "includeItemsFromAllDrives": True
+        }
+        res = requests.get(url, headers=headers, params=params)
+        if res.status_code == 200:
+            files = res.json().get("files", [])
+            if files:
+                return files[0]["id"]
         
-        base_name = os.path.splitext(os.path.basename(src_file))[0].strip()
-        if base_name:
-            creds_path = r"D:\barcodestame\credentials.json"
+        meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
+        r_create = requests.post(url, headers=headers, json=meta, params={"supportsAllDrives": True})
+        if r_create.status_code == 200:
+            return r_create.json().get("id")
+        else:
+            err_str = f"API Error creating '{folder_name}' ({r_create.status_code}): {r_create.text}"
+            self.log_box.insert(tk.END, err_str + "\n")
+            self.log_box.see(tk.END)
+            log_error_to_file(err_str)
+        return None
+
+    def log_folder_structure_to_sheet(self, date_label, sub_main_name, sub_main_id, subfolder_ids_map):
+        token_path = "token.json"
+        if not os.path.exists(token_path):
+            self.log_box.insert(tk.END, "Sheet Log Error: token.json not found.\n")
+            self.log_box.see(tk.END)
+            return
+        try:
+            creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+            client = gspread.authorize(creds)
+            spreadsheet = client.open_by_key("1EDogJjSd9qJd8Y8oUgPtkBPH2kKBbABRDm3raem-eUY")
+            sheet = spreadsheet.get_worksheet(0)
+            
+            main_id = subfolder_ids_map.get("Main", "")
+            part_id = subfolder_ids_map.get("Part", "")
+            container_list_id = subfolder_ids_map.get("Container List", "")
+            barcode_stamp_id = subfolder_ids_map.get("BarCodeAndStamp", "")
+            report_id = subfolder_ids_map.get("Report", "")
+            vgm_id = subfolder_ids_map.get("Container Match Format (VGM)", "")
+
+            row_data = [
+                date_label, 
+                sub_main_name, 
+                sub_main_id, 
+                main_id, 
+                part_id, 
+                container_list_id, 
+                vgm_id, 
+                barcode_stamp_id, 
+                report_id
+            ]
+
             try:
-                client = gspread.service_account(filename=creds_path)
-                spreadsheet = client.open("data_seals")
-                try:
-                    spreadsheet.worksheet(base_name)
-                except gspread.exceptions.WorksheetNotFound:
-                    spreadsheet.add_worksheet(title=base_name, rows=1000, cols=20)
-                    self.log_box.insert(tk.END, f"Auto-created online sheet tab '{base_name}' in Google Drive.\n")
-            except Exception as e:
-                self.log_box.insert(tk.END, f"Warning: Could not auto-create online tab '{base_name}': {e}\n")
-
-            if base_name not in self.target_sheets:
-                self.target_sheets.append(base_name)
-                self.update_active_sheets_label()
-                self.log_box.insert(tk.END, f"Auto-mirrored source name into managed list: '{base_name}'\n")
-                self.log_box.see(tk.END)
-                messagebox.showinfo("Auto-Mirrored", f"Successfully matched and added source name '{base_name}' to your managed sheet list!")
-            else:
-                messagebox.showinfo("Already Active", f"Sheet tab '{base_name}' is already in your managed list.")
-
-    def open_sheet_manager_dialog(self):
-        dlg = tk.Toplevel(self.root)
-        dlg.title("Manage Sheet Tabs")
-        dlg.geometry("400x380")
-        dlg.configure(bg="#f4f6f7")
-        dlg.grab_set()
-
-        tk.Label(dlg, text="Managed Sheet Tabs List:", bg="#f4f6f7", font=("Arial", 11, "bold")).pack(pady=(15, 5))
-        tk.Label(dlg, text="(Adding a sheet here will also create it in your Google Spreadsheet)", bg="#f4f6f7", fg="#7f8c8d", font=("Arial", 9, "italic")).pack(pady=(0, 5))
-
-        list_frame = tk.Frame(dlg, bg="#f4f6f7")
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=5)
-
-        sheet_listbox = tk.Listbox(list_frame, font=("Arial", 11), selectmode=tk.SINGLE)
-        sheet_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        for s in self.target_sheets:
-            sheet_listbox.insert(tk.END, s)
-
-        scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL, command=sheet_listbox.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        sheet_listbox.config(yscrollcommand=scrollbar.set)
-
-        ctrl_frame = tk.Frame(dlg, bg="#f4f6f7")
-        ctrl_frame.pack(fill=tk.X, padx=20, pady=10)
-
-        def add_sheet():
-            new_name = simpledialog.askstring("Add Sheet Tab", "Enter sheet tab name (e.g., report, rey, neath):", parent=dlg)
-            if new_name:
-                clean_name = new_name.strip()
-                if clean_name:
-                    creds_path = r"D:\barcodestame\credentials.json"
-                    try:
-                        client = gspread.service_account(filename=creds_path)
-                        spreadsheet = client.open("data_seals")
-                        try:
-                            spreadsheet.worksheet(clean_name)
-                        except gspread.exceptions.WorksheetNotFound:
-                            spreadsheet.add_worksheet(title=clean_name, rows=1000, cols=20)
-                            self.log_box.insert(tk.END, f"Successfully created online sheet tab '{clean_name}' in Google Drive.\n")
-                    except Exception as e:
-                        self.log_box.insert(tk.END, f"Warning: Could not create online sheet tab '{clean_name}': {e}\n")
-
-                    if clean_name not in self.target_sheets:
-                        self.target_sheets.append(clean_name)
-                        sheet_listbox.insert(tk.END, clean_name)
-                        self.update_active_sheets_label()
-                        self.log_box.insert(tk.END, f"Added sheet tab to local list: '{clean_name}'\n")
-                        self.log_box.see(tk.END)
-
-        def remove_sheet():
-            selected_idx = sheet_listbox.curselection()
-            if selected_idx:
-                idx = selected_idx[0]
-                sheet_to_remove = sheet_listbox.get(idx)
-                if len(self.target_sheets) > 1:
-                    self.target_sheets.remove(sheet_to_remove)
-                    sheet_listbox.delete(idx)
-                    self.update_active_sheets_label()
-                    self.log_box.insert(tk.END, f"Removed sheet tab from list: '{sheet_to_remove}'\n")
+                cell = sheet.find(sub_main_name)
+                if cell:
+                    sheet.update(range_name=f'A{cell.row}:I{cell.row}', values=[row_data])
+                    self.log_box.insert(tk.END, f"-> Updated Google Sheet for: {sub_main_name}\n")
                     self.log_box.see(tk.END)
                 else:
-                    messagebox.showwarning("Warning", "You must keep at least one sheet tab in the list.", parent=dlg)
-
-        btn_add = tk.Button(ctrl_frame, text=" ➕ Add Tab & Create Online ", bg="#27ae60", fg="white", font=("Arial", 10, "bold"), relief=tk.FLAT, padx=10, pady=5, command=add_sheet)
-        btn_add.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
-
-        btn_remove = tk.Button(ctrl_frame, text=" ❌ Remove Selected ", bg="#e74c3c", fg="white", font=("Arial", 10, "bold"), relief=tk.FLAT, padx=10, pady=5, command=remove_sheet)
-        btn_remove.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=(5, 0))
-
-        btn_close = tk.Button(dlg, text="Done / Save", bg="#34495e", fg="white", font=("Arial", 10, "bold"), relief=tk.FLAT, padx=20, pady=6, command=dlg.destroy)
-        btn_close.pack(pady=(0, 15))
-
-    def update_active_sheets_label(self):
-        sheets_str = ", ".join(self.target_sheets)
-        self.lbl_sheets_active.config(text=f"Target Sheets Active: {sheets_str}")
-
-    def select_source_seal_file(self):
-        file_path = filedialog.askopenfilename(filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")])
-        if file_path:
-            self.seal_src_entry.delete(0, tk.END)
-            self.seal_src_entry.insert(0, file_path)
-            self.log_box.insert(tk.END, f"Source CSV report selected: {file_path}\n")
+                    sheet.append_row(row_data)
+                    self.log_box.insert(tk.END, f"-> Appended Google Sheet for: {sub_main_name}\n")
+                    self.log_box.see(tk.END)
+            except gspread.exceptions.CellNotFound:
+                sheet.append_row(row_data)
+                self.log_box.insert(tk.END, f"-> Appended Google Sheet (New) for: {sub_main_name}\n")
+                self.log_box.see(tk.END)
+        except Exception as e:
+            err_msg = f"Error logging folder IDs to Google Sheet: {e}"
+            self.log_box.insert(tk.END, err_msg + "\n")
             self.log_box.see(tk.END)
+            log_error_to_file(err_msg)
 
-    def sync_data_to_google_sheet(self):
-        src_file = self.seal_src_entry.get()
-        if not src_file or not os.path.exists(src_file):
-            return False, "Source CSV report file not found."
+    def manual_create_gdrive_folders(self):
+        self.log_box.insert(tk.END, "Starting GDrive creation & sync for CustomsDocs (Clean Name)...\n")
+        self.log_box.see(tk.END)
+        threading.Thread(target=self.create_gdrive_folders_worker, daemon=True).start()
 
-        source_base_name = os.path.splitext(os.path.basename(src_file))[0].strip().lower()
-        creds_path = r"D:\barcodestame\credentials.json"
-        if not os.path.exists(creds_path):
-            return False, "Missing credentials.json file."
+    def create_gdrive_folders_worker(self):
+        target_path = self.gdrive_src_entry.get().strip()
+        parent_id = TARGET_PARENT_FOLDER_ID
 
         try:
-            client = gspread.service_account(filename=creds_path)
-            spreadsheet = client.open("data_seals")
+            headers = self.get_oauth_headers()
+            folder_base_name = os.path.basename(os.path.normpath(target_path))
+            date_match = re.search(r'(\d{2}-\w{3}-\d{4})', folder_base_name)
+            date_str = date_match.group(1) if date_match else datetime.datetime.now().strftime("%d-%b-%Y")
+
+            # Clean name without (1)
+            c_name = f"CustomsDocs_{date_str}"
+            subfolders_to_create = [
+                "BarCodeAndStamp",
+                "Container List",
+                "Container Match Format (VGM)",
+                "Main",
+                "Part",
+                "Report"
+            ]
+
+            self.log_box.insert(tk.END, f"Processing target: {c_name}...\n")
+            self.log_box.see(tk.END)
             
-            csv_rows = []
-            with open(src_file, mode='r', encoding='utf-8-sig') as f:
-                reader = csv.reader(f)
-                for row in reader:
-                    if row:
-                        csv_rows.append(row)
+            gdrive_folder_id = self.get_or_create_folder_id(headers, parent_id, c_name)
+            if gdrive_folder_id:
+                self.log_box.insert(tk.END, f"-> Verified/Created folder '{c_name}' (ID: {gdrive_folder_id})\n")
+                self.log_box.see(tk.END)
+                subfolder_id_map = {}
+                for sub in subfolders_to_create:
+                    sub_id = self.get_or_create_folder_id(headers, gdrive_folder_id, sub)
+                    if sub_id:
+                        subfolder_id_map[sub] = sub_id
 
-            if not csv_rows:
-                return False, "CSV file is empty."
+                self.log_folder_structure_to_sheet(date_str, c_name, gdrive_folder_id, subfolder_id_map)
+                self.sync_folder_by_id(target_path, gdrive_folder_id, subfolder_id_map, headers)
+                
+                self.log_box.insert(tk.END, f"Successfully processed {c_name} with all file types and reports!\n")
+                self.log_box.see(tk.END)
+                messagebox.showinfo("Success", f"Successfully processed {c_name} and logged IDs to Google Sheet!")
+            else:
+                err_str = f"-> ERROR: Could not create folder {c_name}"
+                self.log_box.insert(tk.END, err_str + "\n")
+                self.log_box.see(tk.END)
+                log_error_to_file(err_str)
 
-            success_count = 0
-            for sheet_name in self.target_sheets:
-                clean_sheet_name = sheet_name.strip().lower()
-                if clean_sheet_name != source_base_name:
+        except Exception as e:
+            err_str = f"Failed to create GDrive folder:\n{e}"
+            log_error_to_file(err_str)
+            messagebox.showerror("Error", err_str)
+
+    def toggle_gdrive_folder_sync_loop(self):
+        if not self.is_gdrive_folder_sync_looping:
+            self.is_gdrive_folder_sync_looping = True
+            self.toggle_gdrive_folder_sync_btn.config(text=" ⏹️ Stop Auto-Sync CustomsDocs ", bg="#c0392b")
+            self.log_box.insert(tk.END, "Google Drive Auto-Sync started...\n")
+            self.log_box.see(tk.END)
+            threading.Thread(target=self.gdrive_folder_sync_loop_worker, daemon=True).start()
+        else:
+            self.is_gdrive_folder_sync_looping = False
+            self.toggle_gdrive_folder_sync_btn.config(text=" ☁️ Start Auto-Sync CustomsDocs ", bg="#8e44ad")
+            self.log_box.insert(tk.END, "Google Drive Auto-Sync stopped.\n")
+            self.log_box.see(tk.END)
+
+    def gdrive_folder_sync_loop_worker(self):
+        while self.is_gdrive_folder_sync_looping:
+            try:
+                target_path = self.gdrive_src_entry.get().strip()
+                parent_id = TARGET_PARENT_FOLDER_ID
+                
+                if not os.path.exists(target_path):
+                    time.sleep(5)
                     continue
 
-                try:
-                    try:
-                        sheet = spreadsheet.worksheet(sheet_name)
-                    except gspread.exceptions.WorksheetNotFound:
-                        sheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=20)
+                headers = self.get_oauth_headers()
+                folder_base_name = os.path.basename(os.path.normpath(target_path))
+                date_match = re.search(r'(\d{2}-\w{3}-\d{4})', folder_base_name)
+                date_str = date_match.group(1) if date_match else datetime.datetime.now().strftime("%d-%b-%Y")
 
-                    existing_data = sheet.get_all_values()
-                    if not existing_data or all(not any(row) for row in existing_data):
-                        sheet.update(range_name='A1', values=csv_rows)
-                        success_count += 1
+                c_name = f"CustomsDocs_{date_str}"
+                gdrive_folder_id = self.get_or_create_folder_id(headers, parent_id, c_name)
+                if gdrive_folder_id:
+                    subfolder_id_map = {}
+                    for sub in ["BarCodeAndStamp", "Container List", "Container Match Format (VGM)", "Main", "Part", "Report"]:
+                        if not self.is_gdrive_folder_sync_looping:
+                            break
+                        sub_id = self.get_or_create_folder_id(headers, gdrive_folder_id, sub)
+                        if sub_id:
+                            subfolder_id_map[sub] = sub_id
+
+                    self.log_folder_structure_to_sheet(date_str, c_name, gdrive_folder_id, subfolder_id_map)
+                    self.sync_folder_by_id(target_path, gdrive_folder_id, subfolder_id_map, headers)
+            except Exception as e:
+                log_error_to_file(f"GDrive Sync Loop Error: {e}")
+            
+            for _ in range(50):
+                if not self.is_gdrive_folder_sync_looping:
+                    break
+                time.sleep(0.5)
+
+    def sync_folder_by_id(self, local_dir, root_gdrive_id, subfolder_id_map, headers):
+        try:
+            if not self.is_gdrive_folder_sync_looping and not self.is_copy_processing and not self.is_watching:
+                pass
+            
+            existing_gdrive_files = set()
+            try:
+                page_token = None
+                while True:
+                    list_url = "https://www.googleapis.com/drive/v3/files"
+                    params = {
+                        "q": f"'{root_gdrive_id}' in parents and trashed = false",
+                        "fields": "nextPageToken, files(name)",
+                        "supportsAllDrives": True,
+                        "includeItemsFromAllDrives": True,
+                        "pageSize": 1000
+                    }
+                    if page_token:
+                        params["pageToken"] = page_token
+
+                    res = requests.get(list_url, headers=headers, params=params)
+                    if res.status_code == 200:
+                        data = res.json()
+                        for f in data.get("files", []):
+                            existing_gdrive_files.add(f["name"].strip().lower())
+                        page_token = data.get("nextPageToken")
+                        if not page_token:
+                            break
                     else:
-                        existing_set = {tuple(row) for row in existing_data}
-                        new_rows = [row for row in csv_rows if tuple(row) not in existing_set]
-                        if new_rows:
-                            sheet.append_rows(new_rows)
-                            success_count += 1
-                except Exception:
-                    pass
-            return True, "Synced"
-        except Exception as e:
-            return False, str(e)
-
-    def toggle_sheet_sync_loop(self):
-        if not self.is_sheet_sync_looping:
-            try:
-                interval_val = float(self.sheet_interval_entry.get().strip())
-                if interval_val <= 0:
-                    raise ValueError()
-            except ValueError:
-                messagebox.showerror("Invalid Interval", "Please enter a valid number of seconds.")
-                return
-
-            self.is_sheet_sync_looping = True
-            self.toggle_sheet_loop_btn.config(text=f"⏹️ Stop Auto-Sync ({interval_val}s)", bg="#c0392b")
-            self.log_box.insert(tk.END, f"Google Sheet Auto-Sync loop started (every {interval_val} seconds).\n")
-            self.log_box.see(tk.END)
-
-            threading.Thread(target=self.sheet_sync_loop_worker, args=(interval_val,), daemon=True).start()
-        else:
-            self.is_sheet_sync_looping = False
-            self.toggle_sheet_loop_btn.config(text="⏱️ Start Auto-Sync Loop", bg="#27ae60")
-            self.log_box.insert(tk.END, "Google Sheet Auto-Sync loop stopped.\n")
-            self.log_box.see(tk.END)
-
-    def sheet_sync_loop_worker(self, interval_seconds):
-        while self.is_sheet_sync_looping:
-            try:
-                self.sync_data_to_google_sheet()
+                        break
             except Exception:
                 pass
-            time.sleep(interval_seconds)
 
-    def toggle_copy_processing(self):
-        if not self.is_copy_processing:
-            source_dir = self.source_entry.get().strip()
-            output_dir = self.output_entry.get().strip()
+            if not os.path.exists(local_dir):
+                return
+            items = os.listdir(local_dir)
             
-            if not source_dir or not output_dir:
-                messagebox.showerror("Error", "Please specify Source folder and Output directory.")
-                return
-
-            parent_dir = os.path.dirname(output_dir)
-            if not os.path.exists(parent_dir):
-                messagebox.showerror("Parent Folder Missing", f"Required parent folder does not exist:\n\n{parent_dir}")
-                return
-
-            os.makedirs(output_dir, exist_ok=True)
-            os.makedirs(os.path.join(output_dir, "list_of_container"), exist_ok=True)
-            dup_folder = os.path.join(output_dir, "Duplicate_containers")
-            os.makedirs(dup_folder, exist_ok=True)
-            
-            report_path = os.path.join(dup_folder, "duplicates_report.csv")
-            try:
-                if not os.path.exists(report_path):
-                    with open(report_path, mode='w', newline='', encoding='utf-8') as f:
-                        writer = csv.writer(f)
-                        writer.writerow(["Timestamp", "Duplicate File", "Container Identifier", "Original File"])
-            except PermissionError:
-                messagebox.showerror("Excel File Locked", "Please close Excel / duplicates_report.csv before starting the app!")
-                return
-
-            self.session_output_dir = output_dir
-            self.is_copy_processing = True
-            self.process_copy_btn.config(text="Stop Auto-Copy & Process", bg="#c0392b")
-            self.log_box.insert(tk.END, f"Auto-Copy & Process started (Continuous Loop, Keep Source). Output: {output_dir}\n")
-            self.log_box.see(tk.END)
-
-            self.toggle_processing_mode_silent()
-            threading.Thread(target=self.copy_processing_loop_worker, daemon=True).start()
-        else:
-            self.is_copy_processing = False
-            self.process_copy_btn.config(text="Start Auto-Copy & Process (Keep Source)", bg="#d35400")
-            self.log_box.insert(tk.END, "Auto-Copy & Process stopped.\n")
-            self.log_box.see(tk.END)
-
-    def copy_processing_loop_worker(self):
-        source_dir = self.source_entry.get()
-        fixed_img = self.load_stamp_image()
-
-        while self.is_copy_processing:
-            try:
-                self.toggle_processing_mode_silent()
-
-                if os.path.exists(source_dir):
-                    os.makedirs(self.session_output_dir, exist_ok=True)
-                    os.makedirs(os.path.join(self.session_output_dir, "list_of_container"), exist_ok=True)
-                    os.makedirs(os.path.join(self.session_output_dir, "Duplicate_containers"), exist_ok=True)
+            def upload_single_item(item):
+                local_item_path = os.path.join(local_dir, item)
+                target_pid = subfolder_id_map.get(item, root_gdrive_id)
+                
+                if os.path.isdir(local_item_path):
+                    sub_id = subfolder_id_map.get(item)
+                    if not sub_id:
+                        sub_id = self.get_or_create_folder_id(headers, root_gdrive_id, item)
                     
-                    all_files = [f for f in os.listdir(source_dir) if f.lower().endswith('.jpg')]
-                    container_files = [f for f in all_files if f not in self.processed_source_files]
-                    
-                    if container_files:
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-                            futures = {
-                                executor.submit(process_single_file, file_name, source_dir, self.session_output_dir, fixed_img, copy_only=True, seen_containers=self.seen_containers, first_seen_files=self.first_seen_files, verify_mode=self.verify_mode_active, register_numbers=self.register_numbers_set): file_name 
-                                for file_name in container_files
-                            }
-                            
-                            for future in concurrent.futures.as_completed(futures):
-                                file_name = futures[future]
-                                self.processed_source_files.add(file_name)
-                                
-                                res_status, result_msg = future.result()
-                                if res_status in ["processed", "duplicate_container"]:
-                                    self.count_processed += 1
-                                    if res_status == "processed":
-                                        self.count_already_stamped += 1
-                                elif res_status == "error":
-                                    self.count_errors += 1
-                                    
-                                if result_msg:
-                                    self.log_box.insert(tk.END, result_msg + "\n")
-                                    self.log_box.see(tk.END)
-                                self.update_output_file_count()
-            except Exception as e:
-                pass
-            time.sleep(1.0)
+                    if sub_id:
+                        sub_map = {item: sub_id}
+                        self.sync_folder_by_id(local_item_path, sub_id, sub_map, headers)
+                
+                elif os.path.isfile(local_item_path):
+                    clean_item = item.strip().lower()
+                    if clean_item in existing_gdrive_files:
+                        return
+
+                    if not is_file_ready(local_item_path):
+                        return
+
+                    try:
+                        with open(local_item_path, 'rb') as f:
+                            file_content = f.read()
+                        
+                        boundary = 'foo_bar_baz'
+                        headers_mp = {"Authorization": headers["Authorization"], "Content-Type": f"multipart/related; boundary={boundary}"}
+                        metadata_part = json.dumps({"name": item, "parents": [target_pid]})
+                        body = (
+                            f"--{boundary}\r\n"
+                            f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+                            f"{metadata_part}\r\n"
+                            f"--{boundary}\r\n"
+                            f"Content-Type: application/octet-stream\r\n\r\n"
+                        ).encode('utf-8') + file_content + f"\r\n--{boundary}--".encode('utf-8')
+                        
+                        for attempt in range(3):
+                            upload_res = requests.post("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true", headers=headers_mp, data=body)
+                            if upload_res.status_code == 200:
+                                existing_gdrive_files.add(clean_item)
+                                self.log_box.insert(tk.END, f"Uploaded: {item}\n")
+                                self.log_box.see(tk.END)
+                                break
+                            elif upload_res.status_code == 403:
+                                time.sleep(2.0 * (attempt + 1))
+                            else:
+                                err_msg = f"GDrive Upload Failed ({upload_res.status_code}) for {item}: {upload_res.text}"
+                                log_error_to_file(err_msg)
+                                break
+                        time.sleep(0.1)
+                    except Exception as e:
+                        log_error_to_file(f"Upload exception on {item}: {e}")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                executor.map(upload_single_item, items)
+
+        except Exception as e:
+            err_str = f"Sync error on {local_dir}: {e}"
+            self.log_box.insert(tk.END, err_str + "\n")
+            self.log_box.see(tk.END)
+            log_error_to_file(err_str)
 
     def update_stats_display(self):
         stats_text = f" 📊 Session Stats — Processed: {self.count_processed}   |   Already Stamped: {self.count_already_stamped}   |   Errors: {self.count_errors}   |   Files Move: {self.count_files_move} "
@@ -958,7 +1051,6 @@ class BarcodeApp:
         log_content = self.log_box.get("1.0", tk.END)
         lines = log_content.split('\n')
         self.log_box.tag_remove("highlight", "1.0", tk.END)
-        
         for idx, line in enumerate(lines):
             if "Error" in line:
                 line_number = idx + 1
@@ -975,99 +1067,25 @@ class BarcodeApp:
             self.src_card.pack_forget()
             self.stamp_card.pack_forget()
             self.out_card.pack_forget()
-            self.seal_card.pack_forget()
             self.expand_log_btn.config(text=" 📜 Restore View ", bg="#7f8c8d")
             self.log_box.config(height=32)
         else:
             self.src_card.pack(fill=tk.X, pady=(0, 12))
             self.stamp_card.pack(fill=tk.X, pady=(0, 12))
             self.out_card.pack(fill=tk.X, pady=(0, 12))
-            self.seal_card.pack(fill=tk.X, pady=(0, 12))
-            
-            self.watch_btn.master.pack_forget()
-            self.log_box.pack_forget()
-            
-            self.watch_btn.master.pack(fill=tk.X, pady=(0, 12))
-            self.log_box.pack(fill=tk.BOTH, expand=True)
-            
             self.expand_log_btn.config(text=" 📜 Expand Log ", bg="#34495e")
             self.log_box.config(height=10)
 
-    def open_current_output_folder(self):
-        target_dir = self.output_entry.get()
-        if target_dir and os.path.exists(target_dir):
-            os.makedirs(target_dir, exist_ok=True)
-            subprocess.Popen(f'explorer "{os.path.abspath(target_dir)}"')
-        else:
-            messagebox.showinfo("Folder Notice", "The output folder path does not exist yet.")
-
-    def zoom_in(self):
-        if self.current_font_size < 22:
-            self.current_font_size += 2
-            self.update_font_sizes()
-
-    def zoom_out(self):
-        if self.current_font_size > 8:
-            self.current_font_size -= 2
-            self.update_font_sizes()
-
-    def update_font_sizes(self):
-        f_norm = ("Arial", self.current_font_size)
-        f_log = ("Consolas", self.current_font_size)
-        
-        for ent in [self.source_entry, self.fixed_entry, self.output_entry, self.seal_src_entry, self.sheet_interval_entry, self.verify_entry]:
-            ent.config(font=f_norm)
-        for btn in [self.btn_src, self.btn_fx, self.btn_out, self.btn_browse_seal_src, self.btn_verify_src]:
-            btn.config(font=f_norm)
-            
-        self.log_box.config(font=f_log)
-
-    def select_source(self):
-        folder = filedialog.askdirectory()
-        if folder:
-            self.source_entry.delete(0, tk.END)
-            self.source_entry.insert(0, folder)
-
-    def select_fixed_file(self):
-        file_path = filedialog.askopenfilename(filetypes=[("Image Files", "*.png;*.jpg;*.jpeg")])
-        if file_path:
-            self.fixed_entry.delete(0, tk.END)
-            self.fixed_entry.insert(0, file_path)
-
-    def select_output(self):
-        folder = filedialog.askdirectory()
-        if folder:
-            self.output_entry.delete(0, tk.END)
-            self.output_entry.insert(0, folder)
-
     def auto_create_barcode_stamp_folder(self):
-        target_dir = self.output_entry.get()
-        if not target_dir:
-            messagebox.showwarning("Warning", "Output directory path is empty.")
-            return
-
-        parent_dir = os.path.dirname(target_dir)
-        if not os.path.exists(parent_dir):
-            messagebox.showerror("Parent Folder Missing", f"Parent folder does not exist:\n\n{parent_dir}")
-            return
-
-        try:
-            os.makedirs(target_dir, exist_ok=True)
-            os.makedirs(os.path.join(target_dir, "list_of_container"), exist_ok=True)
-            dup_folder = os.path.join(target_dir, "Duplicate_containers")
-            err_folder = os.path.join(target_dir, "Error_Files")
-            os.makedirs(dup_folder, exist_ok=True)
-            os.makedirs(err_folder, exist_ok=True)
-            
-            report_path = os.path.join(dup_folder, "duplicates_report.csv")
-            if not os.path.exists(report_path):
-                with open(report_path, mode='w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["Timestamp", "Duplicate File", "Container Identifier", "Original File"])
-
-            messagebox.showinfo("Success", f"Folder and subfolders created successfully:\n{target_dir}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not create folder:\n{e}")
+        target_dir = self.output_entry.get().strip()
+        if target_dir:
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+                os.makedirs(os.path.join(target_dir, "Error_Files"), exist_ok=True)
+                messagebox.showinfo("Success", f"Output folder created successfully:\n{target_dir}")
+            except Exception as e:
+                log_error_to_file(f"Folder creation error: {e}")
+                messagebox.showerror("Error", f"Could not create folder:\n{e}")
 
     def reset_history(self):
         self.count_processed = 0
@@ -1076,6 +1094,7 @@ class BarcodeApp:
         self.seen_containers.clear()
         self.first_seen_files.clear()
         self.processed_source_files.clear()
+        self.progress_bar["value"] = 0
         self.update_output_file_count()
         self.log_box.delete("1.0", tk.END)
         self.log_box.insert(tk.END, "Log cleared and stats reset.\n")
@@ -1094,53 +1113,32 @@ class BarcodeApp:
                     else:
                         new_data.append(item)
                 img_raw.putdata(new_data)
-                
                 enhancer = ImageEnhance.Color(img_raw)
                 img_raw = enhancer.enhance(3.5)
                 contrast_enhancer = ImageEnhance.Contrast(img_raw)
                 img_raw = contrast_enhancer.enhance(3.0)
-                
                 img_raw.thumbnail((500, 500))
                 return img_raw
-            except Exception:
-                pass
+            except Exception as e:
+                log_error_to_file(f"Stamp image load error: {e}")
         return None
 
     def toggle_watch(self):
         if not self.is_watching:
-            target_output_dir = self.output_entry.get()
-            source = self.source_entry.get()
+            target_output_dir = self.output_entry.get().strip()
+            source = self.source_entry.get().strip()
             if not source or not target_output_dir:
                 messagebox.showerror("Missing Information", "Please specify Source folder and Output directory.")
                 return
             
-            parent_dir = os.path.dirname(target_output_dir)
-            if not os.path.exists(parent_dir):
-                messagebox.showerror("Parent Folder Missing", f"Parent folder does not exist:\n\n{parent_dir}")
-                return
-
+            os.makedirs(target_output_dir, exist_ok=True)
+            os.makedirs(os.path.join(target_output_dir, "Error_Files"), exist_ok=True)
             self.session_output_dir = target_output_dir
-            os.makedirs(self.session_output_dir, exist_ok=True)
-            os.makedirs(os.path.join(self.session_output_dir, "list_of_container"), exist_ok=True)
-            dup_folder = os.path.join(self.session_output_dir, "Duplicate_containers")
-            err_folder = os.path.join(self.session_output_dir, "Error_Files")
-            os.makedirs(dup_folder, exist_ok=True)
-            os.makedirs(err_folder, exist_ok=True)
-            
-            report_path = os.path.join(dup_folder, "duplicates_report.csv")
-            try:
-                if not os.path.exists(report_path):
-                    with open(report_path, mode='w', newline='', encoding='utf-8') as f:
-                        writer = csv.writer(f)
-                        writer.writerow(["Timestamp", "Duplicate File", "Container Identifier", "Original File"])
-            except PermissionError:
-                messagebox.showerror("Excel File Locked", "Please close Excel / duplicates_report.csv before starting the app!")
-                return
             
             self.is_watching = True
             self.status_canvas.itemconfig(self.status_circle, fill="#e74c3c")
             self.watch_btn.config(text="Stop Auto-Watch Mode", bg="#c0392b")
-            self.log_box.insert(tk.END, f"Auto-Watch started (Continuous Loop). Output: {self.session_output_dir}\n")
+            self.log_box.insert(tk.END, f"Auto-Watch started. Output: {self.session_output_dir}\n")
             self.log_box.see(tk.END)
             
             self.toggle_processing_mode_silent()
@@ -1149,7 +1147,7 @@ class BarcodeApp:
             self.is_watching = False
             self.status_canvas.itemconfig(self.status_circle, fill="#27ae60")
             self.watch_btn.config(text="Start Auto-Watch & Process", bg="#27ae60")
-            self.log_box.insert(tk.END, "Auto-Watch mode stopped.\n")
+            self.log_box.insert(tk.END, f"Auto-Watch mode stopped.\n")
             self.log_box.see(tk.END)
 
     def watch_folder_loop(self):
@@ -1159,27 +1157,28 @@ class BarcodeApp:
         while self.is_watching:
             try:
                 self.toggle_processing_mode_silent()
-
                 if os.path.exists(source_dir):
                     os.makedirs(self.session_output_dir, exist_ok=True)
-                    os.makedirs(os.path.join(self.session_output_dir, "list_of_container"), exist_ok=True)
-                    os.makedirs(os.path.join(self.session_output_dir, "Duplicate_containers"), exist_ok=True)
-                    os.makedirs(os.path.join(self.session_output_dir, "Error_Files"), exist_ok=True)
+                    all_files = [f for f in os.listdir(source_dir) if os.path.isfile(os.path.join(source_dir, f))]
                     
-                    all_files = [f for f in os.listdir(source_dir) if f.lower().endswith('.jpg')]
-                    container_files = [f for f in all_files if f not in self.processed_source_files]
+                    valid_files = [f for f in all_files if f not in self.processed_source_files and "@" in f]
+                    other_files = [f for f in all_files if f not in self.processed_source_files and "@" not in f]
+                    container_files = valid_files + other_files
                     
                     if container_files:
+                        total_files_batch = len(container_files)
+                        self.progress_bar["maximum"] = total_files_batch
+                        self.progress_bar["value"] = 0
+
                         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
                             futures = {
                                 executor.submit(process_single_file, file_name, source_dir, self.session_output_dir, fixed_img, copy_only=False, seen_containers=self.seen_containers, first_seen_files=self.first_seen_files, verify_mode=self.verify_mode_active, register_numbers=self.register_numbers_set): file_name 
                                 for file_name in container_files
                             }
-                            
+                            completed_count = 0
                             for future in concurrent.futures.as_completed(futures):
                                 file_name = futures[future]
                                 self.processed_source_files.add(file_name)
-                                
                                 res_status, result_msg = future.result()
                                 if res_status in ["processed", "duplicate_container"]:
                                     self.count_processed += 1
@@ -1187,14 +1186,103 @@ class BarcodeApp:
                                         self.count_already_stamped += 1
                                 elif res_status == "error":
                                     self.count_errors += 1
-                                    
                                 if result_msg:
                                     self.log_box.insert(tk.END, result_msg + "\n")
                                     self.log_box.see(tk.END)
+                                completed_count += 1
+                                self.progress_bar["value"] = completed_count
                                 self.update_output_file_count()
             except Exception as e:
-                pass
-            time.sleep(1.0)
+                log_error_to_file(f"Watch folder loop error: {e}")
+            time.sleep(0.5)
+
+    def toggle_copy_processing(self):
+        if not self.is_copy_processing:
+            target_output_dir = self.output_entry.get().strip()
+            source = self.source_entry.get().strip()
+            if not source or not target_output_dir:
+                messagebox.showerror("Error", "Please specify Source folder and Output directory.")
+                return
+
+            os.makedirs(target_output_dir, exist_ok=True)
+            self.session_output_dir = target_output_dir
+            self.is_copy_processing = True
+            self.process_copy_btn.config(text="Stop Auto-Copy & Process", bg="#c0392b")
+            self.log_box.insert(tk.END, f"Auto-Copy & Process started (Keep Source). Output: {target_output_dir}\n")
+            self.log_box.see(tk.END)
+
+            self.toggle_processing_mode_silent()
+            threading.Thread(target=self.copy_processing_loop_worker, daemon=True).start()
+        else:
+            self.is_copy_processing = False
+            self.process_copy_btn.config(text="Start Auto-Copy & Process (Keep Source)", bg="#d35400")
+            self.log_box.insert(tk.END, f"Auto-Copy & Process stopped.\n")
+            self.log_box.see(tk.END)
+
+    def copy_processing_loop_worker(self):
+        source_dir = self.source_entry.get()
+        fixed_img = self.load_stamp_image()
+
+        while self.is_copy_processing:
+            try:
+                self.toggle_processing_mode_silent()
+                if os.path.exists(source_dir):
+                    os.makedirs(self.session_output_dir, exist_ok=True)
+                    all_files = [f for f in os.listdir(source_dir) if os.path.isfile(os.path.join(source_dir, f))]
+                    
+                    valid_files = [f for f in all_files if f not in self.processed_source_files and "@" in f]
+                    other_files = [f for f in all_files if f not in self.processed_source_files and "@" not in f]
+                    container_files = valid_files + other_files
+                    
+                    if container_files:
+                        total_files_batch = len(container_files)
+                        self.progress_bar["maximum"] = total_files_batch
+                        self.progress_bar["value"] = 0
+
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                            futures = {
+                                executor.submit(process_single_file, file_name, source_dir, self.session_output_dir, fixed_img, copy_only=True, seen_containers=self.seen_containers, first_seen_files=self.first_seen_files, verify_mode=self.verify_mode_active, register_numbers=self.register_numbers_set): file_name 
+                                for file_name in container_files
+                            }
+                            completed_count = 0
+                            for future in concurrent.futures.as_completed(futures):
+                                file_name = futures[future]
+                                self.processed_source_files.add(file_name)
+                                res_status, result_msg = future.result()
+                                if res_status in ["processed", "duplicate_container"]:
+                                    self.count_processed += 1
+                                    if res_status == "processed":
+                                        self.count_already_stamped += 1
+                                elif res_status == "error":
+                                    self.count_errors += 1
+                                if result_msg:
+                                    self.log_box.insert(tk.END, result_msg + "\n")
+                                    self.log_box.see(tk.END)
+                                completed_count += 1
+                                self.progress_bar["value"] = completed_count
+                                self.update_output_file_count()
+            except Exception as e:
+                log_error_to_file(f"Copy loop error: {e}")
+            time.sleep(0.5)
+
+    def zoom_in(self):
+        if self.current_font_size < 22:
+            self.current_font_size += 2
+            self.update_font_sizes()
+
+    def zoom_out(self):
+        if self.current_font_size > 8:
+            self.current_font_size -= 2
+            self.update_font_sizes()
+
+    def update_font_sizes(self):
+        f_norm = ("Arial", self.current_font_size)
+        f_log = ("Consolas", self.current_font_size)
+        for ent in [self.source_entry, self.fixed_entry, self.output_entry, self.verify_entry, self.gdrive_src_entry]:
+            ent.config(font=f_norm)
+        for btn in [self.btn_src, self.btn_fx, self.btn_out, self.btn_verify_src, self.btn_gd_src]:
+            btn.config(font=f_norm)
+        self.log_box.config(font=f_log)
 
 if __name__ == "__main__":
     root = tk.Tk()

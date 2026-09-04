@@ -1,0 +1,59 @@
+[2026-08-31 17:19:25] Moved Unidentified File to Error_Files (Missing '@'): 20260814193748_00007 {E 242470}((M)).jpg
+[2026-08-31 17:19:25] Moved Unidentified File to Error_Files (Missing '@'): 20260814193802_00006 {E 240266}((M)).jpg
+[2026-08-31 17:19:25] Moved Unidentified File to Error_Files (Missing '@'): 20260814193802_00011 {E 23979}((M)).jpg
+[2026-08-31 17:19:25] Moved Unidentified File to Error_Files (Missing '@'): 20260814193824_00001 {E 242536}((M)).jpg
+[2026-08-31 17:19:42] Moved Unidentified File to Error_Files (Missing '@'): 20260814193824_00006 {E 242520}((M)).jpg
+[2026-08-31 17:19:42] Moved Unidentified File to Error_Files (Missing '@'): 20260814193824_00010 {E 239389}((M)).jpg
+[2026-08-31 17:19:42] Moved Unidentified File to Error_Files (Missing '@'): 20260814193824_00011 {E 239389}((M)).jpg
+[2026-08-31 17:19:42] Moved Unidentified File to Error_Files (Missing '@'): 20260814193824_00012 {E 239389}((M)).jpg
+[2026-08-31 17:19:42] Moved Unidentified File to Error_Files (Missing '@'): 20260814193824_00016 {E 241907}((M)).jpg
+[2026-08-31 17:19:42] Moved Unidentified File to Error_Files (Missing '@'): 20260814193848_00003 {E 244550}((M)).jpg
+[2026-08-31 17:19:43] Moved Unidentified File to Error_Files (Missing '@'): 20260814193848_00004 {E 244550}((M)).jpg
+[2026-08-31 17:19:43] Moved Unidentified File to Error_Files (Missing '@'): 20260814193848_00005 {E 244550}((M)).jpg
+[2026-08-31 17:19:43] Moved Unidentified File to Error_Files (Missing '@'): 20260814193848_00010 {E 240342}((M)).jpg
+[2026-08-31 17:19:43] Moved Unidentified File to Error_Files (Missing '@'): 20260814193848_00011 {E 240342}((M)).jpg
+[2026-08-31 17:19:43] Moved Unidentified File to Error_Files (Missing '@'): 20260814193848_00012 {E 240342}((M)).jpg
+[2026-08-31 17:19:43] Moved Unidentified File to Error_Files (Missing '@'): 20260814194252_00001 {E 240035}((M)).jpg
+[2026-08-31 17:19:43] Moved Unidentified File to Error_Files (Missing '@'): 20260814195636_00002 {E 241856}((M)).jpg
+[2026-08-31 17:19:43] Moved Unidentified File to Error_Files (Missing '@'): 20260814195636_00007.jpg
+[2026-08-31 17:19:43] Moved Unidentified File to Error_Files (Missing '@'): 20260814195636_00003 {E 241856}((M)).jpg
+[2026-09-04 13:57:35] Error logging folder IDs to Google Sheet: Service account info was not in the expected format, missing fields token_uri, client_email.
+[2026-09-04 14:01:23] Error logging folder IDs to Google Sheet: Service account info was not in the expected format, missing fields token_uri, client_email.
+[2026-09-04 14:01:24] Error logging folder IDs to Google Sheet: Service account info was not in the expected format, missing fields token_uri, client_email.
+[2026-09-04 14:08:06] Error logging folder IDs to Google Sheet: Service account info was not in the expected format, missing fields token_uri, client_email.
+[2026-09-04 14:08:14] Error logging folder IDs to Google Sheet: Service account info was not in the expected format, missing fields token_uri, client_email.
+[2026-09-04 14:11:16] Error logging folder IDs to Google Sheet: Service account info was not in the expected format, missing fields client_email, token_uri.
+[2026-09-04 14:11:16] Error logging folder IDs to Google Sheet: Service account info was not in the expected format, missing fields client_email, token_uri.
+[2026-09-04 14:23:35] Error logging folder IDs to Google Sheet: Service account info was not in the expected format, missing fields token_uri, client_email.
+[2026-09-04 15:06:50] Moved Unidentified File to Error_Files (Missing '@'): 20260805054746_00001.jpg
+[2026-09-04 15:06:50] Moved Unidentified File to Error_Files (Missing '@'): 20260805054746_00002.jpg
+[2026-09-04 15:06:50] Moved Unidentified File to Error_Files (Missing '@'): 20260805054746_00005.jpg
+[2026-09-04 15:06:50] Moved Unidentified File to Error_Files (Missing '@'): 20260805055347_00003.jpg
+[2026-09-04 15:06:50] Moved Unidentified File to Error_Files (Missing '@'): 20260805055347_00004.jpg
+[2026-09-04 15:06:50] Moved Unidentified File to Error_Files (Missing '@'): 20260805055347_00007.jpg
+[2026-09-04 15:06:50] Moved Unidentified File to Error_Files (Missing '@'): 20260805055543_00001.jpg
+[2026-09-04 15:06:50] Moved Unidentified File to Error_Files (Missing '@'): 20260805055543_00004.jpg
+[2026-09-04 15:06:50] Moved Unidentified File to Error_Files (Missing '@'): 20260805055543_00007.jpg
+[2026-09-04 15:06:50] Moved Unidentified File to Error_Files (Missing '@'): 20260805083212_00003.jpg
+[2026-09-04 15:06:50] Moved Unidentified File to Error_Files (Missing '@'): 20260805083212_00004.jpg
+[2026-09-04 15:06:50] Moved Unidentified File to Error_Files (Missing '@'): 20260805083308_00001.jpg
+[2026-09-04 15:06:50] Moved Unidentified File to Error_Files (Missing '@'): 20260805083308_00004.jpg
+[2026-09-04 15:06:50] Moved Unidentified File to Error_Files (Missing '@'): 20260805083308_00007.jpg
+[2026-09-04 15:06:50] Moved Unidentified File to Error_Files (Missing '@'): 20260805083308_00010.jpg
+[2026-09-04 15:06:50] Moved Unidentified File to Error_Files (Missing '@'): 20260805083308_00014.jpg
+[2026-09-04 15:06:50] Moved Unidentified File to Error_Files (Missing '@'): 20260805083308_00015.jpg
+[2026-09-04 15:06:50] Moved Unidentified File to Error_Files (Missing '@'): 20260805083346_00003.jpg
+[2026-09-04 15:06:56] Moved Unidentified File to Error_Files (Missing '@'): 20260805083346_00004.jpg
+[2026-09-04 15:06:56] Moved Unidentified File to Error_Files (Missing '@'): 20260805083346_00006.jpg
+[2026-09-04 15:06:56] Moved Unidentified File to Error_Files (Missing '@'): 20260805083346_00008.jpg
+[2026-09-04 15:06:56] Moved Unidentified File to Error_Files (Missing '@'): 20260805083346_00009.jpg
+[2026-09-04 15:06:56] Moved Unidentified File to Error_Files (Missing '@'): 20260805083346_00011.jpg
+[2026-09-04 15:06:56] Moved Unidentified File to Error_Files (Missing '@'): 20260805083346_00013.jpg
+[2026-09-04 15:06:56] Moved Unidentified File to Error_Files (Missing '@'): 20260805083346_00014.jpg
+[2026-09-04 15:06:56] Moved Unidentified File to Error_Files (Missing '@'): 20260805083511_00007.jpg
+[2026-09-04 15:06:56] Moved Unidentified File to Error_Files (Missing '@'): 20260805083511_00009.jpg
+[2026-09-04 15:06:56] Moved Unidentified File to Error_Files (Missing '@'): 20260805083511_00011.jpg
+[2026-09-04 15:06:57] Moved Unidentified File to Error_Files (Missing '@'): 20260805083511_00012.jpg
+[2026-09-04 15:06:57] Moved Unidentified File to Error_Files (Missing '@'): 20260805083534_00001.jpg
+[2026-09-04 15:06:57] Moved Unidentified File to Error_Files (Missing '@'): 20260805083534_00004.jpg
+[2026-09-04 15:06:57] Moved Unidentified File to Error_Files (Missing '@'): 20260805083534_00011.jpg
