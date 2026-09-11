@@ -1420,6 +1420,8 @@ def run_fully_automatic_startup(app_instance):
             threading.Thread(target=app_instance.gdrive_folder_sync_loop_worker, daemon=True).start()
 
     app_instance.root.after(100, trigger_loops)
+    #hgyhgfvhy
+    #jhbghjn
 
 if __name__ == "__main__":
     root = tk.Tk()
