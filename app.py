@@ -13,6 +13,7 @@ import concurrent.futures
 import time
 import threading
 import subprocess
+import sys
 import gspread
 
 from google.oauth2.credentials import Credentials
@@ -73,16 +74,15 @@ def is_file_ready(file_path):
         size1 = os.path.getsize(file_path)
         if size1 <= 0:
             return False
-        time.sleep(0.2)
+        time.sleep(0.1)
         size2 = os.path.getsize(file_path)
         if size1 != size2:
             return False
-
         with open(file_path, 'ab'):
             pass
         return True
     except Exception:
-        return False
+        return True
 
 def log_error_to_file(error_msg):
     try:
@@ -360,10 +360,87 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
         return ("error", err_str)
 
 class BarcodeApp:
+    def run_full_automated_sequence(self):
+        def log_msg(msg):
+            print(msg)
+            try:
+                self.log_box.insert(tk.END, msg + "\n")
+                self.log_box.see(tk.END)
+            except Exception:
+                pass
+
+        log_msg("=== Starting Automated Saturday Sequence ===")
+        try:
+            log_msg("[Step 1/5] Running Auto_Create Folder...")
+            self.auto_create_barcode_stamp_folder(silent=True)
+
+            log_msg("[Step 2/5] Running Auto-Copy (list_of_container)...")
+            source_dir = self.source_entry.get().strip()
+            output_dir = self.output_entry.get().strip()
+            if source_dir and output_dir and os.path.exists(source_dir):
+                target_list_dir = os.path.join(output_dir, "list_of_container")
+                os.makedirs(target_list_dir, exist_ok=True)
+                for file_name in os.listdir(source_dir):
+                    src_file_path = os.path.join(source_dir, file_name)
+                    dest_file_path = os.path.join(target_list_dir, file_name)
+                    if os.path.isfile(src_file_path) and not os.path.exists(dest_file_path):
+                        if is_file_ready(src_file_path):
+                            try:
+                                shutil.copy2(src_file_path, dest_file_path)
+                            except Exception:
+                                pass
+
+            log_msg("[Step 3/5] Running Auto-Create Gdrive Folder & Log IDs...")
+            target_path = self.gdrive_src_entry.get().strip()
+            parent_id = TARGET_PARENT_FOLDER_ID
+            headers = self.get_oauth_headers()
+            folder_base_name = os.path.basename(os.path.normpath(target_path))
+            date_match = re.search(r'(\d{2}-\w{3}-\d{4})', folder_base_name)
+            date_str = date_match.group(1) if date_match else datetime.datetime.now().strftime("%d-%b-%Y")
+            c_name = f"CustomsDocs_{date_str}"
+            
+            gdrive_folder_id = self.get_or_create_folder_id(headers, parent_id, c_name)
+            subfolder_ids_map = {}
+            if gdrive_folder_id:
+                for sub in ["BarCodeAndStamp", "Container List", "Container Match Format (VGM)", "Main", "Part", "Report"]:
+                    sub_id = self.get_or_create_folder_id(headers, gdrive_folder_id, sub)
+                    if sub_id:
+                        subfolder_ids_map[sub] = sub_id
+                self.log_folder_structure_to_sheet(date_str, c_name, gdrive_folder_id, subfolder_ids_map)
+
+            log_msg("[Step 4/5] Running Auto-Sync CustomsDocs...")
+            if gdrive_folder_id:
+                self.sync_folder_by_id(target_path, gdrive_folder_id, subfolder_ids_map, headers)
+
+            log_msg("[Step 5/5] Starting Auto-Watch & Process...")
+            target_output_dir = self.output_entry.get().strip()
+            if target_output_dir and os.path.exists(source_dir):
+                os.makedirs(target_output_dir, exist_ok=True)
+                os.makedirs(os.path.join(target_output_dir, "Error_Files"), exist_ok=True)
+                fixed_img = self.load_stamp_image()
+                all_files = [f for f in os.listdir(source_dir) if os.path.isfile(os.path.join(source_dir, f))]
+                valid_files = [f for f in all_files if "@" in f]
+                other_files = [f for f in all_files if "@" not in f]
+                container_files = valid_files + other_files
+                
+                if container_files:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                        futures = [
+                            executor.submit(process_single_file, file_name, source_dir, target_output_dir, fixed_img, copy_only=False, seen_containers=self.seen_containers, first_seen_files=self.first_seen_files, verify_mode=self.verify_mode_active, register_numbers=self.register_numbers_set)
+                            for file_name in container_files
+                        ]
+                        concurrent.futures.wait(futures)
+
+            log_msg("=== Automated Sequence Completed Successfully ===")
+        except Exception as e:
+            err_str = f"ERROR during automated sequence: {e}"
+            log_msg(err_str)
+            log_error_to_file(err_str)
+
     def __init__(self, root):
         self.root = root
         self.root.title("High-Speed Scrollable Barcode App")
-        self.root.geometry("1020x840")
+        self.root.geometry("1020x880")
         self.root.configure(bg="#f4f6f7")
         
         self.is_watching = False
@@ -586,13 +663,23 @@ class BarcodeApp:
             pady=6, 
             command=self.toggle_gdrive_folder_sync_loop
         )
-        self.toggle_gdrive_folder_sync_btn.pack(side=tk.LEFT)
+        self.toggle_gdrive_folder_sync_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        # MANUAL TIME INTERVAL INPUT BOX & START BUTTON FOR AUTO-SYNC CUSTOMSDOCS
+        tk.Label(gdrive_ctrl_frame, text="Sync Interval (sec):", bg="#ffffff", font=("Arial", self.current_font_size, "bold")).pack(side=tk.LEFT, padx=(4, 2))
+        
+        self.sync_interval_entry = tk.Entry(gdrive_ctrl_frame, font=("Arial", self.current_font_size), width=5, relief=tk.SOLID, bd=1)
+        self.sync_interval_entry.pack(side=tk.LEFT, padx=(0, 4))
+        self.sync_interval_entry.insert(0, "10")
 
         action_btns_frame = tk.Frame(inner_pad, bg="#f4f6f7")
         action_btns_frame.pack(fill=tk.X, pady=(0, 12))
 
         self.watch_btn = tk.Button(action_btns_frame, text="Start Auto-Watch & Process", bg="#27ae60", fg="white", font=("Arial", 11, "bold"), bd=0, relief=tk.FLAT, command=self.toggle_watch)
         self.watch_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5), ipady=8)
+
+        self.auto_sequence_btn = tk.Button(action_btns_frame, text="Run Full 5-Step Automation", bg="#2980b9", fg="white", font=("Arial", 11, "bold"), bd=0, relief=tk.FLAT, command=lambda: threading.Thread(target=self.run_full_automated_sequence, daemon=True).start())
+        self.auto_sequence_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 5), ipady=8)
 
         self.process_copy_btn = tk.Button(action_btns_frame, text="Start Auto-Copy & Process (Keep Source)", bg="#d35400", fg="white", font=("Arial", 11, "bold"), bd=0, relief=tk.FLAT, command=self.toggle_copy_processing)
         self.process_copy_btn.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(5, 0), ipady=8)
@@ -752,8 +839,8 @@ class BarcodeApp:
                         src_file_path = os.path.join(source_dir, file_name)
                         dest_file_path = os.path.join(target_list_dir, file_name)
                         
-                        if os.path.isfile(src_file_path) and not os.path.exists(dest_file_path):
-                            if is_file_ready(src_file_path) and not os.path.exists(dest_file_path):
+                        if os.path.isfile(src_file_path):
+                            if is_file_ready(src_file_path):
                                 try:
                                     shutil.copy2(src_file_path, dest_file_path)
                                 except Exception:
@@ -783,16 +870,12 @@ class BarcodeApp:
             return r_create.json().get("id")
         else:
             err_str = f"API Error creating '{folder_name}' ({r_create.status_code}): {r_create.text}"
-            self.log_box.insert(tk.END, err_str + "\n")
-            self.log_box.see(tk.END)
             log_error_to_file(err_str)
         return None
 
     def log_folder_structure_to_sheet(self, date_label, sub_main_name, sub_main_id, subfolder_ids_map):
         token_path = "token.json"
         if not os.path.exists(token_path):
-            self.log_box.insert(tk.END, "Sheet Log Error: token.json not found.\n")
-            self.log_box.see(tk.END)
             return
         try:
             creds = Credentials.from_authorized_user_file(token_path, SCOPES)
@@ -823,25 +906,14 @@ class BarcodeApp:
                 cell = sheet.find(sub_main_name)
                 if cell:
                     sheet.update(range_name=f'A{cell.row}:I{cell.row}', values=[row_data])
-                    self.log_box.insert(tk.END, f"-> Updated Google Sheet for: {sub_main_name}\n")
-                    self.log_box.see(tk.END)
                 else:
                     sheet.append_row(row_data)
-                    self.log_box.insert(tk.END, f"-> Appended Google Sheet for: {sub_main_name}\n")
-                    self.log_box.see(tk.END)
             except gspread.exceptions.CellNotFound:
                 sheet.append_row(row_data)
-                self.log_box.insert(tk.END, f"-> Appended Google Sheet (New) for: {sub_main_name}\n")
-                self.log_box.see(tk.END)
         except Exception as e:
-            err_msg = f"Error logging folder IDs to Google Sheet: {e}"
-            self.log_box.insert(tk.END, err_msg + "\n")
-            self.log_box.see(tk.END)
-            log_error_to_file(err_msg)
+            log_error_to_file(f"Error logging folder IDs to Google Sheet: {e}")
 
     def manual_create_gdrive_folders(self):
-        self.log_box.insert(tk.END, "Starting GDrive creation & sync for CustomsDocs (Clean Name)...\n")
-        self.log_box.see(tk.END)
         threading.Thread(target=self.create_gdrive_folders_worker, daemon=True).start()
 
     def create_gdrive_folders_worker(self):
@@ -854,7 +926,6 @@ class BarcodeApp:
             date_match = re.search(r'(\d{2}-\w{3}-\d{4})', folder_base_name)
             date_str = date_match.group(1) if date_match else datetime.datetime.now().strftime("%d-%b-%Y")
 
-            # Clean name without (1)
             c_name = f"CustomsDocs_{date_str}"
             subfolders_to_create = [
                 "BarCodeAndStamp",
@@ -864,14 +935,9 @@ class BarcodeApp:
                 "Part",
                 "Report"
             ]
-
-            self.log_box.insert(tk.END, f"Processing target: {c_name}...\n")
-            self.log_box.see(tk.END)
             
             gdrive_folder_id = self.get_or_create_folder_id(headers, parent_id, c_name)
             if gdrive_folder_id:
-                self.log_box.insert(tk.END, f"-> Verified/Created folder '{c_name}' (ID: {gdrive_folder_id})\n")
-                self.log_box.see(tk.END)
                 subfolder_id_map = {}
                 for sub in subfolders_to_create:
                     sub_id = self.get_or_create_folder_id(headers, gdrive_folder_id, sub)
@@ -880,37 +946,34 @@ class BarcodeApp:
 
                 self.log_folder_structure_to_sheet(date_str, c_name, gdrive_folder_id, subfolder_id_map)
                 self.sync_folder_by_id(target_path, gdrive_folder_id, subfolder_id_map, headers)
-                
-                self.log_box.insert(tk.END, f"Successfully processed {c_name} with all file types and reports!\n")
-                self.log_box.see(tk.END)
-                messagebox.showinfo("Success", f"Successfully processed {c_name} and logged IDs to Google Sheet!")
             else:
-                err_str = f"-> ERROR: Could not create folder {c_name}"
-                self.log_box.insert(tk.END, err_str + "\n")
-                self.log_box.see(tk.END)
-                log_error_to_file(err_str)
-
+                log_error_to_file(f"-> ERROR: Could not create folder {c_name}")
         except Exception as e:
-            err_str = f"Failed to create GDrive folder:\n{e}"
-            log_error_to_file(err_str)
-            messagebox.showerror("Error", err_str)
+            log_error_to_file(f"Failed to create GDrive folder:\n{e}")
 
     def toggle_gdrive_folder_sync_loop(self):
         if not self.is_gdrive_folder_sync_looping:
             self.is_gdrive_folder_sync_looping = True
             self.toggle_gdrive_folder_sync_btn.config(text=" ⏹️ Stop Auto-Sync CustomsDocs ", bg="#c0392b")
-            self.log_box.insert(tk.END, "Google Drive Auto-Sync started...\n")
+            self.log_box.insert(tk.END, "Auto-Sync CustomsDocs loop started with manual time interval...\n")
             self.log_box.see(tk.END)
             threading.Thread(target=self.gdrive_folder_sync_loop_worker, daemon=True).start()
         else:
             self.is_gdrive_folder_sync_looping = False
             self.toggle_gdrive_folder_sync_btn.config(text=" ☁️ Start Auto-Sync CustomsDocs ", bg="#8e44ad")
-            self.log_box.insert(tk.END, "Google Drive Auto-Sync stopped.\n")
+            self.log_box.insert(tk.END, "Auto-Sync CustomsDocs loop stopped.\n")
             self.log_box.see(tk.END)
 
     def gdrive_folder_sync_loop_worker(self):
         while self.is_gdrive_folder_sync_looping:
             try:
+                try:
+                    interval = float(self.sync_interval_entry.get().strip())
+                    if interval <= 0:
+                        interval = 10.0
+                except:
+                    interval = 10.0
+
                 target_path = self.gdrive_src_entry.get().strip()
                 parent_id = TARGET_PARENT_FOLDER_ID
                 
@@ -932,31 +995,35 @@ class BarcodeApp:
                             break
                         sub_id = self.get_or_create_folder_id(headers, gdrive_folder_id, sub)
                         if sub_id:
-                            subfolder_id_map[sub] = sub_id
+                            subfolder_ids_map[sub] = sub_id
 
-                    self.log_folder_structure_to_sheet(date_str, c_name, gdrive_folder_id, subfolder_id_map)
-                    self.sync_folder_by_id(target_path, gdrive_folder_id, subfolder_id_map, headers)
+                    self.log_folder_structure_to_sheet(date_str, c_name, gdrive_folder_id, subfolder_ids_map)
+                    self.sync_folder_by_id(target_path, gdrive_folder_id, subfolder_ids_map, headers)
+                
+                elapsed = 0.0
+                while elapsed < interval and self.is_gdrive_folder_sync_looping:
+                    time.sleep(0.5)
+                    elapsed += 0.5
             except Exception as e:
                 log_error_to_file(f"GDrive Sync Loop Error: {e}")
-            
-            for _ in range(50):
-                if not self.is_gdrive_folder_sync_looping:
-                    break
-                time.sleep(0.5)
+                time.sleep(2)
 
     def sync_folder_by_id(self, local_dir, root_gdrive_id, subfolder_id_map, headers):
         try:
-            if not self.is_gdrive_folder_sync_looping and not self.is_copy_processing and not self.is_watching:
-                pass
+            folder_name = os.path.basename(os.path.normpath(local_dir)).lower()
             
-            existing_gdrive_files = set()
+            # STRICT TARGETING: ONLY Report folder and Container List check continuously. 
+            # All other folders (Main, Part, BarCodeAndStamp, etc.) skip existing files instantly for maximum speed!
+            is_report_or_list_folder = ("report" in folder_name) or ("container list" in folder_name)
+
+            existing_gdrive_files = {}
             try:
                 page_token = None
                 while True:
                     list_url = "https://www.googleapis.com/drive/v3/files"
                     params = {
                         "q": f"'{root_gdrive_id}' in parents and trashed = false",
-                        "fields": "nextPageToken, files(name)",
+                        "fields": "nextPageToken, files(id, name)",
                         "supportsAllDrives": True,
                         "includeItemsFromAllDrives": True,
                         "pageSize": 1000
@@ -968,7 +1035,7 @@ class BarcodeApp:
                     if res.status_code == 200:
                         data = res.json()
                         for f in data.get("files", []):
-                            existing_gdrive_files.add(f["name"].strip().lower())
+                            existing_gdrive_files[f["name"].strip().lower()] = f.get("id")
                         page_token = data.get("nextPageToken")
                         if not page_token:
                             break
@@ -996,16 +1063,43 @@ class BarcodeApp:
                 
                 elif os.path.isfile(local_item_path):
                     clean_item = item.strip().lower()
-                    if clean_item in existing_gdrive_files:
-                        return
-
-                    if not is_file_ready(local_item_path):
-                        return
 
                     try:
-                        with open(local_item_path, 'rb') as f:
-                            file_content = f.read()
-                        
+                        file_id = existing_gdrive_files.get(clean_item)
+
+                        # FAST SPEED OPTIMIZATION: If it's an image/PDF folder (Main, Part, etc.) and already exists on Google Drive, skip instantly!
+                        if not is_report_or_list_folder and file_id:
+                            return
+
+                        read_path = local_item_path
+                        temp_shadow_path = None
+                        if is_report_or_list_folder:
+                            try:
+                                temp_shadow_path = local_item_path + ".tmp_sync_force"
+                                shutil.copy2(local_item_path, temp_shadow_path)
+                                read_path = temp_shadow_path
+                            except Exception:
+                                read_path = local_item_path
+
+                        file_content = b""
+                        for _ in range(5):
+                            try:
+                                with open(read_path, 'rb') as f:
+                                    file_content = f.read()
+                                if file_content:
+                                    break
+                            except Exception:
+                                time.sleep(0.2)
+
+                        if temp_shadow_path and os.path.exists(temp_shadow_path):
+                            try:
+                                os.remove(temp_shadow_path)
+                            except:
+                                pass
+
+                        if not file_content:
+                            return
+
                         boundary = 'foo_bar_baz'
                         headers_mp = {"Authorization": headers["Authorization"], "Content-Type": f"multipart/related; boundary={boundary}"}
                         metadata_part = json.dumps({"name": item, "parents": [target_pid]})
@@ -1017,31 +1111,37 @@ class BarcodeApp:
                             f"Content-Type: application/octet-stream\r\n\r\n"
                         ).encode('utf-8') + file_content + f"\r\n--{boundary}--".encode('utf-8')
                         
-                        for attempt in range(3):
-                            upload_res = requests.post("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true", headers=headers_mp, data=body)
-                            if upload_res.status_code == 200:
-                                existing_gdrive_files.add(clean_item)
-                                self.log_box.insert(tk.END, f"Uploaded: {item}\n")
-                                self.log_box.see(tk.END)
-                                break
-                            elif upload_res.status_code == 403:
-                                time.sleep(2.0 * (attempt + 1))
-                            else:
-                                err_msg = f"GDrive Upload Failed ({upload_res.status_code}) for {item}: {upload_res.text}"
-                                log_error_to_file(err_msg)
-                                break
-                        time.sleep(0.1)
+                        if file_id:
+                            update_url = f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=multipart&supportsAllDrives=true"
+                            for attempt in range(3):
+                                upload_res = requests.patch(update_url, headers=headers_mp, data=body)
+                                if upload_res.status_code == 200:
+                                    break
+                                elif upload_res.status_code == 403:
+                                    time.sleep(2.0 * (attempt + 1))
+                                else:
+                                    break
+                        else:
+                            create_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true"
+                            for attempt in range(3):
+                                upload_res = requests.post(create_url, headers=headers_mp, data=body)
+                                if upload_res.status_code == 200:
+                                    existing_gdrive_files[clean_item] = upload_res.json().get("id")
+                                    break
+                                elif upload_res.status_code == 403:
+                                    time.sleep(2.0 * (attempt + 1))
+                                else:
+                                    break
+                        time.sleep(0.05)
                     except Exception as e:
-                        log_error_to_file(f"Upload exception on {item}: {e}")
+                        log_error_to_file(f"Upload/Update exception on {item}: {e}")
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            worker_count = 1 if is_report_or_list_folder else 6
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
                 executor.map(upload_single_item, items)
 
         except Exception as e:
-            err_str = f"Sync error on {local_dir}: {e}"
-            self.log_box.insert(tk.END, err_str + "\n")
-            self.log_box.see(tk.END)
-            log_error_to_file(err_str)
+            log_error_to_file(f"Sync error on {local_dir}: {e}")
 
     def update_stats_display(self):
         stats_text = f" 📊 Session Stats — Processed: {self.count_processed}   |   Already Stamped: {self.count_already_stamped}   |   Errors: {self.count_errors}   |   Files Move: {self.count_files_move} "
@@ -1076,16 +1176,18 @@ class BarcodeApp:
             self.expand_log_btn.config(text=" 📜 Expand Log ", bg="#34495e")
             self.log_box.config(height=10)
 
-    def auto_create_barcode_stamp_folder(self):
+    def auto_create_barcode_stamp_folder(self, silent=True):
         target_dir = self.output_entry.get().strip()
         if target_dir:
             try:
                 os.makedirs(target_dir, exist_ok=True)
                 os.makedirs(os.path.join(target_dir, "Error_Files"), exist_ok=True)
-                messagebox.showinfo("Success", f"Output folder created successfully:\n{target_dir}")
+                if not silent:
+                    messagebox.showinfo("Success", f"Output folder created successfully:\n{target_dir}")
             except Exception as e:
                 log_error_to_file(f"Folder creation error: {e}")
-                messagebox.showerror("Error", f"Could not create folder:\n{e}")
+                if not silent:
+                    messagebox.showerror("Error", f"Could not create folder:\n{e}")
 
     def reset_history(self):
         self.count_processed = 0
@@ -1210,7 +1312,7 @@ class BarcodeApp:
             self.process_copy_btn.config(text="Stop Auto-Copy & Process", bg="#c0392b")
             self.log_box.insert(tk.END, f"Auto-Copy & Process started (Keep Source). Output: {target_output_dir}\n")
             self.log_box.see(tk.END)
-#44444
+
             self.toggle_processing_mode_silent()
             threading.Thread(target=self.copy_processing_loop_worker, daemon=True).start()
         else:
@@ -1284,7 +1386,43 @@ class BarcodeApp:
             btn.config(font=f_norm)
         self.log_box.config(font=f_log)
 
+def run_fully_automatic_startup(app_instance):
+    app_instance.run_full_automated_sequence()
+    
+    def trigger_loops():
+        if not app_instance.is_watching:
+            target_output_dir = app_instance.output_entry.get().strip()
+            source = app_instance.source_entry.get().strip()
+            if source and target_output_dir:
+                os.makedirs(target_output_dir, exist_ok=True)
+                os.makedirs(os.path.join(target_output_dir, "Error_Files"), exist_ok=True)
+                app_instance.session_output_dir = target_output_dir
+                app_instance.is_watching = True
+                app_instance.status_canvas.itemconfig(app_instance.status_circle, fill="#e74c3c")
+                app_instance.watch_btn.config(text="Stop Auto-Watch Mode", bg="#c0392b")
+                app_instance.log_box.insert(tk.END, f"Auto-Watch started. Output: {app_instance.session_output_dir}\n")
+                app_instance.log_box.see(tk.END)
+                app_instance.toggle_processing_mode_silent()
+                threading.Thread(target=app_instance.watch_folder_loop, daemon=True).start()
+
+        if not app_instance.is_list_copy_looping:
+            app_instance.is_list_copy_looping = True
+            app_instance.toggle_list_copy_btn.config(text=" ⏹️ Stop Auto-Copy (list_of_container) ", bg="#c0392b")
+            app_instance.log_box.insert(tk.END, "Auto-Copy loop for 'list_of_container' started...\n")
+            app_instance.log_box.see(tk.END)
+            threading.Thread(target=app_instance.list_copy_loop_worker, daemon=True).start()
+
+        if not app_instance.is_gdrive_folder_sync_looping:
+            app_instance.is_gdrive_folder_sync_looping = True
+            app_instance.toggle_gdrive_folder_sync_btn.config(text=" ⏹️ Stop Auto-Sync CustomsDocs ", bg="#c0392b")
+            app_instance.log_box.insert(tk.END, "Auto-Sync CustomsDocs loop started...\n")
+            app_instance.log_box.see(tk.END)
+            threading.Thread(target=app_instance.gdrive_folder_sync_loop_worker, daemon=True).start()
+
+    app_instance.root.after(100, trigger_loops)
+
 if __name__ == "__main__":
     root = tk.Tk()
     app = BarcodeApp(root)
+    threading.Thread(target=run_fully_automatic_startup, args=(app,), daemon=True).start()
     root.mainloop()

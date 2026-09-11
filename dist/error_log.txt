@@ -1,0 +1,103 @@
+[2026-09-06 19:09:21] Sync error on D:\Scan\Main OutputFastOCR\OutputFastOCR_06-Sep-2026\All output images for another process: cannot schedule new futures after interpreter shutdown
+[2026-09-06 19:09:22] Sync error on D:\Scan\Main OutputFastOCR\OutputFastOCR_06-Sep-2026\Container List: cannot schedule new futures after interpreter shutdown
+[2026-09-06 19:09:22] Sync error on D:\Scan\Main OutputFastOCR\OutputFastOCR_06-Sep-2026\BarcodeandStamp: cannot schedule new futures after interpreter shutdown
+[2026-09-06 19:09:23] Sync error on D:\Scan\Main OutputFastOCR\OutputFastOCR_06-Sep-2026\Main: cannot schedule new futures after interpreter shutdown
+[2026-09-06 19:09:23] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:23] Sync error on D:\Scan\Main OutputFastOCR\OutputFastOCR_06-Sep-2026\Container Match Format: cannot schedule new futures after interpreter shutdown
+[2026-09-06 19:09:24] Sync error on D:\Scan\Main OutputFastOCR\OutputFastOCR_06-Sep-2026\No Seal: cannot schedule new futures after interpreter shutdown
+[2026-09-06 19:09:24] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:25] Sync error on D:\Scan\Main OutputFastOCR\OutputFastOCR_06-Sep-2026\Not Under GHP: cannot schedule new futures after interpreter shutdown
+[2026-09-06 19:09:25] Sync error on D:\Scan\Main OutputFastOCR\OutputFastOCR_06-Sep-2026\Part: cannot schedule new futures after interpreter shutdown
+[2026-09-06 19:09:26] Sync error on D:\Scan\Main OutputFastOCR\OutputFastOCR_06-Sep-2026\Report: cannot schedule new futures after interpreter shutdown
+[2026-09-06 19:09:26] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:27] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:29] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:31] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:32] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:34] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:35] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:37] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:38] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:40] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:42] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:43] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:45] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:46] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:48] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:49] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:51] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:52] GDrive Sync Loop Error: main thread is not in main loop
+[2026-09-06 19:09:52] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:54] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:56] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:57] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:09:59] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:00] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:02] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:04] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:05] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:07] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:08] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:10] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:11] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:13] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:14] Sync error on D:\Scan\Main OutputFastOCR\OutputFastOCR_06-Sep-2026\Container List\Processed_Backup: cannot schedule new futures after interpreter shutdown
+[2026-09-06 19:10:15] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:16] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:18] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:18] GDrive Sync Loop Error: main thread is not in main loop
+[2026-09-06 19:10:19] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:21] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:22] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:24] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:25] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:27] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:29] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:30] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:32] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:33] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:35] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:36] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:38] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:40] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:41] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:43] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:44] GDrive Sync Loop Error: main thread is not in main loop
+[2026-09-06 19:10:44] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:46] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:47] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:49] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:51] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:52] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:54] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:55] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:57] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:10:58] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:11:00] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:11:02] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:11:03] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:11:05] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:11:06] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:11:08] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:11:09] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:11:10] GDrive Sync Loop Error: main thread is not in main loop
+[2026-09-06 19:11:11] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:11:13] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:11:14] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:11:16] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:11:17] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:11:19] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:11:20] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:11:22] Watch folder loop error: main thread is not in main loop
+[2026-09-06 19:11:24] Watch folder loop error: main thread is not in main loop
+[2026-09-08 12:57:00] Sync error on D:\Scan\Main OutputFastOCR\OutputFastOCR_08-Sep-2026\BarcodeandStamp\list_of_container: cannot schedule new futures after interpreter shutdown
+[2026-09-08 12:57:04] Sync error on D:\Scan\Main OutputFastOCR\OutputFastOCR_08-Sep-2026\Container Match Format: cannot schedule new futures after interpreter shutdown
+[2026-09-08 12:57:04] Sync error on D:\Scan\Main OutputFastOCR\OutputFastOCR_08-Sep-2026\Main: cannot schedule new futures after interpreter shutdown
+[2026-09-08 12:57:11] Sync error on D:\Scan\Main OutputFastOCR\OutputFastOCR_08-Sep-2026\Report: cannot schedule new futures after interpreter shutdown
+[2026-09-08 13:01:56] Upload exception on 20260808_090917_090854_0.pdf: ('Connection aborted.', ConnectionResetError(10054, 'An existing connection was forcibly closed by the remote host'))
+[2026-09-10 16:26:58] Watch folder loop error: main thread is not in main loop
+[2026-09-10 16:27:00] Sync error on D:/Scan/Main OutputFastOCR/OutputFastOCR_05-Sep-2026\Container Match Format\Finish_Container&Seal: cannot schedule new futures after interpreter shutdown
+[2026-09-10 16:27:00] Watch folder loop error: main thread is not in main loop
+[2026-09-10 16:27:00] Sync error on D:/Scan/Main OutputFastOCR/OutputFastOCR_05-Sep-2026\Part: cannot schedule new futures after interpreter shutdown
+[2026-09-10 16:27:01] Sync error on D:/Scan/Main OutputFastOCR/OutputFastOCR_05-Sep-2026\Not Under GHP: cannot schedule new futures after interpreter shutdown
+[2026-09-10 16:27:01] Sync error on D:/Scan/Main OutputFastOCR/OutputFastOCR_05-Sep-2026\Report: cannot schedule new futures after interpreter shutdown
