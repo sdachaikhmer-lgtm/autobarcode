@@ -5,7 +5,8 @@ import csv
 import shutil
 import json
 import tkinter as tk
-from tkinter import filedialog, scrolledtext, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox
+import customtkinter as ctk
 from PIL import Image, ImageOps, ImageDraw, ImageFont, ImageEnhance
 import requests
 from io import BytesIO
@@ -14,6 +15,8 @@ import time
 import threading
 import subprocess
 import sys
+import hashlib
+import mimetypes
 import gspread
 
 from google.oauth2.credentials import Credentials
@@ -22,9 +25,25 @@ from google.auth.transport.requests import Request
 
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+CHIP_ON = "#2fa866"
+CHIP_OFF = ("gray55", "gray45")
+MODE_CONTAINER_COLOR = "#e08a1e"
+MODE_VERIFY_COLOR = "#2fa866"
+
 duplicate_lock = threading.Lock()
+gdrive_lock = threading.Lock()
 CONFIG_FILE = "app_config.json"
+INDEX_FILE = "gdrive_index.json"  # Persistent Local Index Map for Drive File IDs
 TARGET_PARENT_FOLDER_ID = "1sTeOcK79ytlePV0zF84zFKA2Q52t82pT"
+GDRIVE_SUBFOLDERS = ["BarCodeAndStamp", "Container List", "Container Match Format (VGM)", "Main", "Part", "Report"]
+# Local top-level folder name (lower-case) -> Drive subfolder it belongs to, when the names differ
+GDRIVE_FOLDER_ALIASES = {"container match format": "container match format (vgm)"}
+SYNC_WORKERS = 8
+SYNC_INTERVAL_MIN, SYNC_INTERVAL_MAX = 1, 600
+SYNC_INTERVAL_FINE_MAX = 30  # up to here the stepper moves 1 s at a time, above it 5 s at a time
+RECONCILE_SECONDS = 600  # how often Drive is re-listed to repair files deleted/changed there
 
 def save_config(data):
     try:
@@ -41,6 +60,24 @@ def load_config():
     except Exception:
         pass
     return {}
+
+def load_gdrive_index():
+    try:
+        if os.path.exists(INDEX_FILE):
+            with open(INDEX_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_gdrive_index(index_data):
+    try:
+        tmp_path = INDEX_FILE + ".tmp"
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(index_data, f, indent=2)
+        os.replace(tmp_path, INDEX_FILE)
+    except Exception:
+        pass
 
 def draw_wrapped_text(draw, text, font, max_width):
     lines = []
@@ -148,20 +185,46 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
 
     try:
         before_at, after_at = file_name.split("@", 1)
-        number_matches = re.findall(r'\d+', after_at)
-        if not number_matches:
-            number_matches = re.findall(r'\d+', file_name)
-            
-        container_unique_key = after_at.strip().split('.')[0].upper()
+        containers_raw = after_at.strip().split('.')[0]
+        containers = [c.strip() for c in containers_raw.split('-')]
+        
+        numeric_values = []
+        for cont in containers:
+            digits_only = "".join(filter(str.isdigit, cont))
+            if digits_only:
+                numeric_values.append(int(digits_only))
 
-        if not number_matches:
+        container_unique_key = containers_raw.upper()
+
+        if not numeric_values:
             force_move_to_error()
             err_str = f"Moved Unidentified File to Error_Files (No numbers): {file_name}"
             log_error_to_file(err_str)
             return ("error", err_str)
 
-        barcode_text = number_matches[0]
+        if len(numeric_values) > 1:
+            barcode_text = str(sum(numeric_values))
+        else:
+            barcode_text = str(numeric_values[0])
+
+        if len(numeric_values) > 1:
+            last_three = int(barcode_text[-3:]) if len(barcode_text) >= 3 else int(barcode_text)
+            rotation_angle = float(last_three / 3.0)
+        else:
+            single_val_str = str(numeric_values[0])
+            last_digit = int(single_val_str[-1])
+            last_two_digits = int(single_val_str[-2:]) if len(single_val_str) >= 2 else int(single_val_str)
+            
+            if last_digit % 2 != 0:
+                rotation_angle = float(last_two_digits + 190)
+            else:
+                rotation_angle = float(last_two_digits + 180)
+
+        if rotation_angle > 360: 
+            rotation_angle -= 360
+
         matched_main_filename = None
+        registered_key = None  # duplicate-tracking key this call added, undone if we must retry later
 
         if verify_mode:
             match_e = re.search(r'E\s*(\d+)', file_name, re.IGNORECASE)
@@ -217,6 +280,7 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
                         return ("duplicate_container", f"Skipped Duplicate Register ({matched_reg}) | {file_name}")
                     else:
                         seen_containers.add(matched_reg)
+                        registered_key = matched_reg
                         if matched_reg not in first_seen_files:
                             first_seen_files[matched_reg] = file_name
 
@@ -249,6 +313,7 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
                         return ("duplicate_container", f"Skipped Duplicate Container ({container_unique_key}) | {file_name}")
                     else:
                         seen_containers.add(container_unique_key)
+                        registered_key = container_unique_key
                         if container_unique_key not in first_seen_files:
                             first_seen_files[container_unique_key] = file_name
 
@@ -261,19 +326,32 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
                     pass
             return ("output_existing", None)
 
-        only_digits = "".join(filter(str.isdigit, barcode_text))
-        last_two = int(only_digits[-2:]) if len(only_digits) >= 2 else 0
-        calculated_angle = last_two + 180 if last_two % 2 == 0 else last_two + 190
-        if calculated_angle > 360: calculated_angle -= 360
-        rotation_angle = float(calculated_angle)
-
         with Image.open(source_file_path) as img:
             base_img = img.convert("RGBA").copy()
             
         base_width, base_height = base_img.size
         
         barcode_url = f"https://barcodeapi.org/api/code128/{requests.utils.quote(barcode_text)}"
-        response = requests.get(barcode_url, timeout=3)
+        response = None
+        for attempt in range(3):
+            try:
+                response = requests.get(barcode_url, timeout=10)
+                if response.status_code == 200 or (400 <= response.status_code < 500 and response.status_code != 429):
+                    break
+            except requests.RequestException:
+                response = None
+            time.sleep(1 + attempt)
+
+        if response is None or response.status_code == 429 or response.status_code >= 500:
+            # Temporary network/API problem: leave the file where it is and try again later
+            if registered_key is not None:
+                with duplicate_lock:
+                    seen_containers.discard(registered_key)
+                    if first_seen_files.get(registered_key) == file_name:
+                        first_seen_files.pop(registered_key, None)
+            retry_msg = f"Barcode service unavailable, will retry: {file_name}"
+            log_error_to_file(retry_msg)
+            return ("retry", retry_msg)
         
         if response.status_code != 200:
             force_move_to_error()
@@ -351,7 +429,7 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
                     pass
         
         action_label = "Copied & Processed" if copy_only else "Success & Moved"
-        return ("processed", f"{action_label}: {file_name} | Barcode: {barcode_text}")
+        return ("processed", f"{action_label}: {file_name} | Barcode Sum: {barcode_text} | Angle: {rotation_angle:.1f}°")
         
     except Exception as e:
         force_move_to_error()
@@ -359,17 +437,52 @@ def process_single_file(file_name, source_dir, output_dir, fixed_img, copy_only=
         log_error_to_file(err_str)
         return ("error", err_str)
 
+class LogBox(ctk.CTkTextbox):
+    """Activity log that colours each line by what it says and can filter by kind."""
+    TAG_COLORS = {"error": "#e5484d", "warn": "#d98e04", "upload": "#3b8ed0", "ok": "#2fa866"}
+    MAX_LINES = 5000
+
+    def __init__(self, master, **kwargs):
+        super().__init__(master, **kwargs)
+        for tag, color in self.TAG_COLORS.items():
+            self.tag_config(tag, foreground=color)
+        self.tag_config("info")
+
+    @staticmethod
+    def classify(text):
+        low = text.lower()
+        if "no errors" in low:
+            return "info"
+        if "[gdrive sync]" in low:
+            return "upload" if "failed (will retry): 0" in low else "warn"
+        if "error" in low or "failed" in low or "moved unidentified" in low or "moved stuck" in low:
+            return "error"
+        if "retry" in low or "skipped" in low or "duplicate" in low or "unavailable" in low:
+            return "warn"
+        if "success" in low or "copied" in low or "passed non-image" in low:
+            return "ok"
+        return "info"
+
+    def insert(self, index, text, tags=None):
+        if text.strip():
+            text = datetime.datetime.now().strftime("[%H:%M:%S] ") + text
+        super().insert(index, text, tags or self.classify(text))
+        if int(self.index("end-1c").split(".")[0]) > self.MAX_LINES:
+            self.delete("1.0", f"{self.MAX_LINES // 5}.0")
+
+    def apply_filter(self, mode):
+        visible = {"All": {"error", "warn", "upload", "ok", "info"}, "Errors": {"error", "warn"}, "Uploads": {"upload"}}[mode]
+        for tag in ("error", "warn", "upload", "ok", "info"):
+            self.tag_config(tag, elide=tag not in visible)
+
+
 class BarcodeApp:
     def run_full_automated_sequence(self):
         def log_msg(msg):
             print(msg)
-            try:
-                self.log_box.insert(tk.END, msg + "\n")
-                self.log_box.see(tk.END)
-            except Exception:
-                pass
+            self.ui_log(msg)
 
-        log_msg("=== Starting Automated Saturday Sequence ===")
+        log_msg("=== Starting Automated Sequence ===")
         try:
             log_msg("[Step 1/5] Running Auto_Create Folder...")
             self.auto_create_barcode_stamp_folder(silent=True)
@@ -408,7 +521,7 @@ class BarcodeApp:
                         subfolder_ids_map[sub] = sub_id
                 self.log_folder_structure_to_sheet(date_str, c_name, gdrive_folder_id, subfolder_ids_map)
 
-            log_msg("[Step 4/5] Running Auto-Sync CustomsDocs...")
+            log_msg("[Step 4/5] Running Initial Sync CustomsDocs...")
             if gdrive_folder_id:
                 self.sync_folder_by_id(target_path, gdrive_folder_id, subfolder_ids_map, headers)
 
@@ -439,255 +552,283 @@ class BarcodeApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("High-Speed Scrollable Barcode App")
-        self.root.geometry("1020x880")
-        self.root.configure(bg="#f4f6f7")
-        
+        self.root.title("Barcode & Stamp Control Center")
+        self.root.geometry("1180x780")
+        self.root.minsize(980, 640)
+
         self.is_watching = False
-        self.is_copy_processing = False  
-        self.is_list_copy_looping = False  
-        self.is_gdrive_folder_sync_looping = False  
-        self.current_font_size = 11  
-        self.session_output_dir = "" 
+        self.is_copy_processing = False
+        self.is_list_copy_looping = False
+        self.is_gdrive_folder_sync_looping = False
+        self.current_font_size = 12
+        self.session_output_dir = ""
         self.is_log_expanded = False
-        
-        self.verify_mode_active = False 
-        self.register_numbers_set = {} 
-        
+
+        self.verify_mode_active = False
+        self.register_numbers_set = {}
+
         self.seen_containers = set()
-        self.first_seen_files = {}  
+        self.first_seen_files = {}
         self.processed_source_files = set()
-        
+
         self.count_processed = 0
         self.count_already_stamped = 0
         self.count_files_move = 0
         self.count_errors = 0
+        self.progress_total = 1
 
         self.config_data = load_config()
-        
-        container_outer = tk.Frame(root, bg="#f4f6f7")
-        container_outer.pack(fill=tk.BOTH, expand=True)
-
-        self.canvas = tk.Canvas(container_outer, bg="#f4f6f7", highlightthickness=0)
-        self.scrollbar = tk.Scrollbar(container_outer, orient=tk.VERTICAL, command=self.canvas.yview)
-        
-        self.main_frame = tk.Frame(self.canvas, bg="#f4f6f7")
-        
-        self.main_frame.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        )
-        
-        self.canvas_window = self.canvas.create_window((0, 0), window=self.main_frame, anchor="nw")
-        
-        self.canvas.bind(
-            "<Configure>",
-            lambda e: self.canvas.itemconfig(self.canvas_window, width=e.width)
-        )
-
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
-        
-        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        def _on_mousewheel(event):
-            self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
-        
-        inner_pad = tk.Frame(self.main_frame, bg="#f4f6f7")
-        inner_pad.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
-
-        top_control_frame = tk.Frame(inner_pad, bg="#f4f6f7")
-        top_control_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        left_ctrls = tk.Frame(top_control_frame, bg="#f4f6f7")
-        left_ctrls.pack(side=tk.LEFT)
-        
-        self.reset_btn = tk.Button(left_ctrls, text=" 🔄 Clear Log ", bg="#f39c12", fg="white", font=("Arial", 10, "bold"), bd=0, relief=tk.FLAT, padx=8, pady=5, command=self.reset_history)
-        self.reset_btn.pack(side=tk.LEFT, padx=(0, 4))
-
-        self.jump_error_btn = tk.Button(left_ctrls, text=" ⚠️ Jump to Error ", bg="#e74c3c", fg="white", font=("Arial", 10, "bold"), bd=0, relief=tk.FLAT, padx=8, pady=5, command=self.jump_to_error_log)
-        self.jump_error_btn.pack(side=tk.LEFT, padx=(0, 4))
-
-        self.expand_log_btn = tk.Button(left_ctrls, text=" 📜 Expand Log ", bg="#34495e", fg="white", font=("Arial", 10, "bold"), bd=0, relief=tk.FLAT, padx=8, pady=5, command=self.toggle_expand_log)
-        self.expand_log_btn.pack(side=tk.LEFT)
-
-        zoom_frame = tk.Frame(top_control_frame, bg="#f4f6f7")
-        zoom_frame.pack(side=tk.RIGHT)
-        
-        self.zoom_out_btn = tk.Button(zoom_frame, text=" 🔍- ", font=("Arial", 10, "bold"), width=3, command=self.zoom_out)
-        self.zoom_out_btn.pack(side=tk.LEFT, padx=2)
-        
-        self.zoom_in_btn = tk.Button(zoom_frame, text=" 🔍+ ", font=("Arial", 10, "bold"), width=3, command=self.zoom_in)
-        self.zoom_in_btn.pack(side=tk.LEFT, padx=2)
-
-        mode_card = tk.LabelFrame(inner_pad, text=" Processing Mode & Verify Configuration ", bg="#ffffff", fg="#2c3e50", font=("Arial", 10, "bold"), padx=15, pady=10)
-        mode_card.pack(fill=tk.X, pady=(0, 12))
-
-        mode_top_frame = tk.Frame(mode_card, bg="#ffffff")
-        mode_top_frame.pack(fill=tk.X, pady=5)
-
-        self.mode_lbl = tk.Label(mode_top_frame, text="Current Mode: [ Container-Only Mode ]", bg="#ffffff", fg="#e67e22", font=("Arial", 11, "bold"))
-        self.mode_lbl.pack(side=tk.LEFT, padx=5)
-
-        self.mode_toggle_btn = tk.Button(mode_top_frame, text=" 🔀 Switch to Verify Mode ", bg="#2980b9", fg="white", font=("Arial", 10, "bold"), relief=tk.FLAT, padx=12, pady=5, command=self.toggle_processing_mode)
-        self.mode_toggle_btn.pack(side=tk.RIGHT, padx=5)
+        self.gdrive_index_map = load_gdrive_index()  # Load persistent file ID cache
+        self.index_lock = threading.Lock()
+        self.index_dirty = False
+        self.sync_lock = threading.Lock()  # one mirror pass at a time (startup sequence and loop would otherwise race)
+        self.children_lock = threading.Lock()
+        self.drive_children = {}  # folder id -> files already on Drive (listed once per session)
+        self.verified_folder_ids = set()
+        self.retry_after = {}  # local path -> earliest time to retry a failed upload
+        self.gd_headers = {}
+        self.gd_headers_time = 0.0
+        self.gd_ctx = None
+        self.file_retry_after = {}  # file name -> earliest time to retry after a temporary barcode failure
+        self.last_upload_text = "no uploads yet"
+        try:
+            self.sync_interval = max(SYNC_INTERVAL_MIN, min(SYNC_INTERVAL_MAX, int(self.config_data.get("sync_interval", 10))))
+        except (TypeError, ValueError):
+            self.sync_interval = 10
+        self.interval_repeat_job = None
 
         today_base_folder = get_today_active_date_folder()
-        default_verify_path = os.path.join(today_base_folder, "Main")
-        default_container_path = os.path.join(today_base_folder, "Container List")
-        default_output_nested = os.path.join(today_base_folder, "BarcodeandStamp")
-        default_gdrive_src = today_base_folder
-
-        tk.Label(mode_card, text="Verify Source Location (Main Folder with 'M' filenames):", bg="#ffffff", font=("Arial", self.current_font_size, "bold")).pack(anchor="w", pady=(8, 0))
-        verify_src_inner = tk.Frame(mode_card, bg="#ffffff")
-        verify_src_inner.pack(fill=tk.X, pady=3)
-
-        self.verify_entry = tk.Entry(verify_src_inner, font=("Arial", self.current_font_size), relief=tk.SOLID, bd=1)
-        self.verify_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4, padx=(0, 8))
-        self.verify_entry.insert(0, default_verify_path)
-        
-        self.btn_verify_src = tk.Button(verify_src_inner, text="Browse...", font=("Arial", self.current_font_size), bg="#ecf0f1", command=self.select_verify_source)
-        self.btn_verify_src.pack(side=tk.RIGHT)
-
-        self.stats_frame = tk.Frame(inner_pad, bg="#2c3e50", relief=tk.FLAT, bd=0)
-        self.stats_frame.pack(fill=tk.X, pady=(0, 15))
-        
-        stats_inner = tk.Frame(self.stats_frame, bg="#2c3e50")
-        stats_inner.pack(pady=10, padx=15, fill=tk.X)
-        
-        self.status_canvas = tk.Canvas(stats_inner, width=16, height=16, bg="#2c3e50", highlightthickness=0)
-        self.status_canvas.pack(side=tk.LEFT, padx=(0, 8))
-        self.status_circle = self.status_canvas.create_oval(2, 2, 14, 14, fill="#27ae60", outline="")
-
-        self.stats_lbl = tk.Label(
-            stats_inner, 
-            text=" 📊 Session Stats — Processed: 0   |   Already Stamped: 0   |   Errors: 0   |   Files Move: 0 ", 
-            bg="#2c3e50", 
-            fg="white", 
-            font=("Arial", 11, "bold")
-        )
-        self.stats_lbl.pack(side=tk.LEFT)
-
-        self.progress_bar = ttk.Progressbar(inner_pad, orient="horizontal", mode="determinate")
-        self.progress_bar.pack(fill=tk.X, pady=(0, 12))
-
-        self.src_card = tk.LabelFrame(inner_pad, text=" Source Configuration ", bg="#ffffff", fg="#2c3e50", font=("Arial", 10, "bold"), padx=15, pady=10)
-        self.src_card.pack(fill=tk.X, pady=(0, 12))
-
-        tk.Label(self.src_card, text="Source Folder (Container List):", bg="#ffffff", font=("Arial", self.current_font_size, "bold")).pack(anchor="w", pady=(2, 0))
-        src_inner = tk.Frame(self.src_card, bg="#ffffff")
-        src_inner.pack(fill=tk.X, pady=3)
-        
-        self.source_entry = tk.Entry(src_inner, font=("Arial", self.current_font_size), relief=tk.SOLID, bd=1)
-        self.source_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4, padx=(0, 8))
-        self.source_entry.insert(0, default_container_path)
-        
-        self.btn_src = tk.Button(src_inner, text="Browse...", font=("Arial", self.current_font_size), bg="#ecf0f1", command=self.select_source)
-        self.btn_src.pack(side=tk.RIGHT)
-
         default_stamp_path = self.config_data.get("stamp_path", r"D:\barcodestame\new 2 stamp RB.png")
 
-        self.stamp_card = tk.LabelFrame(inner_pad, text=" Stamp Image Configuration ", bg="#ffffff", fg="#2c3e50", font=("Arial", 10, "bold"), padx=15, pady=10)
-        self.stamp_card.pack(fill=tk.X, pady=(0, 12))
+        self.pages = {}
+        self.nav_buttons = {}
+        self.switches = {}
+        self.chips = {}
+        self.stat_labels = {}
 
-        self.lbl2 = tk.Label(self.stamp_card, text="Fixed Stamp File Path (.png):", bg="#ffffff", font=("Arial", self.current_font_size, "bold"))
-        self.lbl2.pack(anchor="w", pady=(2, 0))
-        
-        stamp_inner = tk.Frame(self.stamp_card, bg="#ffffff")
-        stamp_inner.pack(fill=tk.X, pady=5)
-        
-        self.fixed_entry = tk.Entry(stamp_inner, font=("Arial", self.current_font_size), relief=tk.SOLID, bd=1)
-        self.fixed_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4, padx=(0, 8))
-        self.fixed_entry.insert(0, default_stamp_path)
-        
-        self.btn_fx = tk.Button(stamp_inner, text="Browse...", font=("Arial", self.current_font_size), bg="#ecf0f1", command=self.select_fixed_file)
-        self.btn_fx.pack(side=tk.RIGHT)
+        self.root.grid_columnconfigure(1, weight=1)
+        self.root.grid_rowconfigure(0, weight=1)
+        self.build_sidebar()
 
-        self.out_card = tk.LabelFrame(inner_pad, text=" Output Destination Configuration ", bg="#ffffff", fg="#2c3e50", font=("Arial", 10, "bold"), padx=15, pady=10)
-        self.out_card.pack(fill=tk.X, pady=(0, 12))
-
-        self.lbl3 = tk.Label(self.out_card, text="Output Directory:", bg="#ffffff", font=("Arial", self.current_font_size, "bold"))
-        self.lbl3.pack(anchor="w", pady=(2, 0))
-        
-        out_inner = tk.Frame(self.out_card, bg="#ffffff")
-        out_inner.pack(fill=tk.X, pady=5)
-        
-        self.output_entry = tk.Entry(out_inner, font=("Arial", self.current_font_size), relief=tk.SOLID, bd=1)
-        self.output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4, padx=(0, 8))
-        self.output_entry.insert(0, default_output_nested)
-        
-        self.btn_out = tk.Button(out_inner, text="Browse...", font=("Arial", self.current_font_size), bg="#ecf0f1", command=self.select_output)
-        self.btn_out.pack(side=tk.RIGHT)
-
-        output_ctrl_frame = tk.Frame(self.out_card, bg="#ffffff")
-        output_ctrl_frame.pack(fill=tk.X, pady=(8, 2))
-        
-        self.auto_create_out_btn = tk.Button(output_ctrl_frame, text=" 📁 Auto-Create Folder ", bg="#27ae60", fg="white", font=("Arial", 10, "bold"), relief=tk.FLAT, padx=10, pady=6, command=self.auto_create_barcode_stamp_folder)
-        self.auto_create_out_btn.pack(side=tk.LEFT, padx=(0, 8))
-
-        self.open_folder_btn = tk.Button(output_ctrl_frame, text=" 📂 Open Output Folder ", bg="#3498db", fg="white", font=("Arial", 10, "bold"), relief=tk.FLAT, padx=12, pady=6, command=self.open_current_output_folder)
-        self.open_folder_btn.pack(side=tk.LEFT, padx=(0, 8))
-
-        self.toggle_list_copy_btn = tk.Button(output_ctrl_frame, text=" 🚀 Start Auto-Copy (list_of_container) ", bg="#8e44ad", fg="white", font=("Arial", 10, "bold"), relief=tk.FLAT, padx=10, pady=6, command=self.toggle_list_copy_loop)
-        self.toggle_list_copy_btn.pack(side=tk.LEFT)
-
-        gdrive_card = tk.LabelFrame(inner_pad, text=" Google Drive OAuth Quota Sync -> Main Customs Docs (Sophal) ", bg="#ffffff", fg="#2c3e50", font=("Arial", 10, "bold"), padx=15, pady=10)
-        gdrive_card.pack(fill=tk.X, pady=(0, 12))
-
-        tk.Label(gdrive_card, text="Local Date Folder to Mirror (Updates automatically to today's date):", bg="#ffffff", font=("Arial", self.current_font_size, "bold")).pack(anchor="w", pady=(2, 0))
-        gd_src_inner = tk.Frame(gdrive_card, bg="#ffffff")
-        gd_src_inner.pack(fill=tk.X, pady=3)
-        
-        self.gdrive_src_entry = tk.Entry(gd_src_inner, font=("Arial", self.current_font_size), relief=tk.SOLID, bd=1)
-        self.gdrive_src_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4, padx=(0, 8))
-        self.gdrive_src_entry.insert(0, default_gdrive_src)
-        
-        self.btn_gd_src = tk.Button(gd_src_inner, text="Browse...", font=("Arial", self.current_font_size), bg="#ecf0f1", command=self.select_gdrive_source)
-        self.btn_gd_src.pack(side=tk.RIGHT)
-
-        gdrive_ctrl_frame = tk.Frame(gdrive_card, bg="#ffffff")
-        gdrive_ctrl_frame.pack(fill=tk.X, pady=(8, 2))
-
-        self.auto_create_gdrive_btn = tk.Button(gdrive_ctrl_frame, text=" 📁 Auto-Create GDrive Folder & Log IDs ", bg="#27ae60", fg="white", font=("Arial", 10, "bold"), relief=tk.FLAT, padx=10, pady=6, command=self.manual_create_gdrive_folders)
-        self.auto_create_gdrive_btn.pack(side=tk.LEFT, padx=(0, 8))
-
-        self.toggle_gdrive_folder_sync_btn = tk.Button(
-            gdrive_ctrl_frame, 
-            text=" ☁️ Start Auto-Sync CustomsDocs ", 
-            bg="#8e44ad", 
-            fg="white", 
-            font=("Arial", 10, "bold"), 
-            relief=tk.FLAT, 
-            padx=10, 
-            pady=6, 
-            command=self.toggle_gdrive_folder_sync_loop
-        )
-        self.toggle_gdrive_folder_sync_btn.pack(side=tk.LEFT, padx=(0, 8))
-
-        # MANUAL TIME INTERVAL INPUT BOX & START BUTTON FOR AUTO-SYNC CUSTOMSDOCS
-        tk.Label(gdrive_ctrl_frame, text="Sync Interval (sec):", bg="#ffffff", font=("Arial", self.current_font_size, "bold")).pack(side=tk.LEFT, padx=(4, 2))
-        
-        self.sync_interval_entry = tk.Entry(gdrive_ctrl_frame, font=("Arial", self.current_font_size), width=5, relief=tk.SOLID, bd=1)
-        self.sync_interval_entry.pack(side=tk.LEFT, padx=(0, 4))
-        self.sync_interval_entry.insert(0, "10")
-
-        action_btns_frame = tk.Frame(inner_pad, bg="#f4f6f7")
-        action_btns_frame.pack(fill=tk.X, pady=(0, 12))
-
-        self.watch_btn = tk.Button(action_btns_frame, text="Start Auto-Watch & Process", bg="#27ae60", fg="white", font=("Arial", 11, "bold"), bd=0, relief=tk.FLAT, command=self.toggle_watch)
-        self.watch_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5), ipady=8)
-
-        self.auto_sequence_btn = tk.Button(action_btns_frame, text="Run Full 5-Step Automation", bg="#2980b9", fg="white", font=("Arial", 11, "bold"), bd=0, relief=tk.FLAT, command=lambda: threading.Thread(target=self.run_full_automated_sequence, daemon=True).start())
-        self.auto_sequence_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 5), ipady=8)
-
-        self.process_copy_btn = tk.Button(action_btns_frame, text="Start Auto-Copy & Process (Keep Source)", bg="#d35400", fg="white", font=("Arial", 11, "bold"), bd=0, relief=tk.FLAT, command=self.toggle_copy_processing)
-        self.process_copy_btn.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(5, 0), ipady=8)
-
-        self.log_box = scrolledtext.ScrolledText(inner_pad, font=("Consolas", self.current_font_size), height=10, state="normal", relief=tk.SOLID, bd=1)
-        self.log_box.pack(fill=tk.BOTH, expand=True)
+        content = ctk.CTkFrame(self.root, fg_color="transparent")
+        content.grid(row=0, column=1, sticky="nsew", padx=20, pady=18)
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_rowconfigure(0, weight=1)
+        self.pages["Dashboard"] = self.build_dashboard_page(content)
+        self.pages["Paths"] = self.build_paths_page(content, today_base_folder, default_stamp_path)
+        self.pages["Drive"] = self.build_drive_page(content, today_base_folder)
+        for page in self.pages.values():
+            page.grid(row=0, column=0, sticky="nsew")
+        self.show_page("Dashboard")
 
         self.update_output_file_count()
+        self.current_base_folder = today_base_folder
+        self.root.after(60000, self.roll_over_date_folders)
+
+    # ---------------------------------------------------------------- UI building
+    def build_sidebar(self):
+        side = ctk.CTkFrame(self.root, width=210, corner_radius=0)
+        side.grid(row=0, column=0, sticky="nsw")
+        side.grid_propagate(False)
+        side.grid_rowconfigure(5, weight=1)
+
+        ctk.CTkLabel(side, text="Barcode & Stamp", font=ctk.CTkFont(size=20, weight="bold")).grid(row=0, column=0, padx=20, pady=(26, 0), sticky="w")
+        ctk.CTkLabel(side, text="Control Center", text_color=("gray40", "gray60")).grid(row=1, column=0, padx=20, pady=(0, 22), sticky="w")
+
+        for i, name in enumerate(("Dashboard", "Paths", "Drive")):
+            btn = ctk.CTkButton(side, text=name, anchor="w", height=40, corner_radius=8, fg_color="transparent",
+                                text_color=("gray10", "gray90"), hover_color=("gray78", "gray28"),
+                                command=lambda n=name: self.show_page(n))
+            btn.grid(row=2 + i, column=0, padx=14, pady=3, sticky="ew")
+            self.nav_buttons[name] = btn
+
+        self.auto_sequence_btn = ctk.CTkButton(
+            side, text="Run full 5-step automation", height=42, font=ctk.CTkFont(size=13, weight="bold"),
+            command=lambda: threading.Thread(target=self.run_full_automated_sequence, daemon=True).start())
+        self.auto_sequence_btn.grid(row=6, column=0, padx=14, pady=(0, 12), sticky="ew")
+
+        self.theme_switch = ctk.CTkSegmentedButton(side, values=["Dark", "Light"], command=lambda v: ctk.set_appearance_mode(v))
+        self.theme_switch.set("Dark")
+        self.theme_switch.grid(row=7, column=0, padx=14, pady=(0, 20), sticky="ew")
+
+    def show_page(self, name):
+        self.pages[name].tkraise()
+        for n, btn in self.nav_buttons.items():
+            btn.configure(fg_color=("gray78", "gray25") if n == name else "transparent")
+
+    def build_dashboard_page(self, parent):
+        page = ctk.CTkFrame(parent, fg_color="transparent")
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_rowconfigure(1, weight=1)
+
+        self.top_area = ctk.CTkFrame(page, fg_color="transparent")
+        self.top_area.grid(row=0, column=0, sticky="ew")
+        self.top_area.grid_columnconfigure(0, weight=1)
+
+        header = ctk.CTkFrame(self.top_area, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        ctk.CTkLabel(header, text="Dashboard", font=ctk.CTkFont(size=26, weight="bold")).pack(side="left")
+        for key, text in (("list", "List copy"), ("drive", "Drive sync"), ("watch", "Watching")):
+            chip = ctk.CTkLabel(header, text=f"●  {text}", text_color=CHIP_OFF, font=ctk.CTkFont(size=13, weight="bold"))
+            chip.pack(side="right", padx=(16, 0))
+            self.chips[key] = chip
+
+        cards = ctk.CTkFrame(self.top_area, fg_color="transparent")
+        cards.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        for col, (key, title) in enumerate((("processed", "Processed"), ("stamped", "Already stamped"), ("errors", "Errors"), ("files", "Files in output"))):
+            cards.grid_columnconfigure(col, weight=1, uniform="stat")
+            card = ctk.CTkFrame(cards, corner_radius=12)
+            card.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0 if col == 3 else 6))
+            ctk.CTkLabel(card, text=title, text_color=("gray40", "gray60")).pack(anchor="w", padx=16, pady=(12, 0))
+            value = ctk.CTkLabel(card, text="0", font=ctk.CTkFont(size=30, weight="bold"))
+            value.pack(anchor="w", padx=16, pady=(0, 12))
+            self.stat_labels[key] = value
+
+        self.sync_status_lbl = ctk.CTkLabel(self.top_area, text="Drive sync: waiting for first pass", anchor="w", text_color=("gray35", "gray65"))
+        self.sync_status_lbl.grid(row=2, column=0, sticky="ew", padx=4)
+        self.progress_bar = ctk.CTkProgressBar(self.top_area, height=8)
+        self.progress_bar.set(0)
+        self.progress_bar.grid(row=3, column=0, sticky="ew", pady=(6, 12))
+
+        controls = ctk.CTkFrame(self.top_area, corner_radius=12)
+        controls.grid(row=4, column=0, sticky="ew", pady=(0, 12))
+        controls.grid_columnconfigure((0, 1), weight=1)
+        specs = (
+            ("watch", "Auto-watch & process (moves source)", self.toggle_watch),
+            ("copy", "Auto-copy & process (keeps source)", self.toggle_copy_processing),
+            ("list", "Auto-copy list_of_container", self.toggle_list_copy_loop),
+            ("drive", "Auto-sync CustomsDocs to Drive", self.toggle_gdrive_folder_sync_loop),
+        )
+        for i, (key, text, command) in enumerate(specs):
+            switch = ctk.CTkSwitch(controls, text=text, command=command, font=ctk.CTkFont(size=13))
+            switch.grid(row=i // 2, column=i % 2, sticky="w", padx=20, pady=(14 if i < 2 else 6, 6))
+            self.switches[key] = switch
+
+        mode_row = ctk.CTkFrame(controls, fg_color="transparent")
+        mode_row.grid(row=2, column=0, columnspan=2, sticky="ew", padx=20, pady=(6, 14))
+        self.mode_lbl = ctk.CTkLabel(mode_row, text="Mode: Container-Only", text_color=MODE_CONTAINER_COLOR, font=ctk.CTkFont(size=13, weight="bold"))
+        self.mode_lbl.pack(side="left")
+        self.mode_toggle_btn = ctk.CTkButton(mode_row, text="Switch to Verify Mode", width=200, command=self.toggle_processing_mode)
+        self.mode_toggle_btn.pack(side="right")
+
+        log_card = ctk.CTkFrame(page, corner_radius=12)
+        log_card.grid(row=1, column=0, sticky="nsew")
+        log_card.grid_columnconfigure(0, weight=1)
+        log_card.grid_rowconfigure(1, weight=1)
+
+        bar = ctk.CTkFrame(log_card, fg_color="transparent")
+        bar.grid(row=0, column=0, sticky="ew", padx=14, pady=(10, 4))
+        ctk.CTkLabel(bar, text="Activity log", font=ctk.CTkFont(size=15, weight="bold")).pack(side="left")
+        self.zoom_in_btn = ctk.CTkButton(bar, text="A+", width=36, command=self.zoom_in)
+        self.zoom_out_btn = ctk.CTkButton(bar, text="A-", width=36, command=self.zoom_out)
+        self.expand_log_btn = ctk.CTkButton(bar, text="Expand log", width=100, fg_color=("gray70", "gray30"), hover_color=("gray62", "gray38"), text_color=("gray10", "gray95"), command=self.toggle_expand_log)
+        self.jump_error_btn = ctk.CTkButton(bar, text="Jump to error", width=110, fg_color="#c0392b", hover_color="#a93226", command=self.jump_to_error_log)
+        self.reset_btn = ctk.CTkButton(bar, text="Clear", width=70, fg_color=("gray70", "gray30"), hover_color=("gray62", "gray38"), text_color=("gray10", "gray95"), command=self.reset_history)
+        for widget in (self.zoom_in_btn, self.zoom_out_btn, self.expand_log_btn, self.jump_error_btn, self.reset_btn):
+            widget.pack(side="right", padx=(6, 0))
+        self.log_filter = ctk.CTkSegmentedButton(bar, values=["All", "Errors", "Uploads"], command=lambda mode: self.log_box.apply_filter(mode))
+        self.log_filter.set("All")
+        self.log_filter.pack(side="right", padx=(0, 14))
+
+        self.log_box = LogBox(log_card, font=("Consolas", self.current_font_size), wrap="word")
+        self.log_box.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        return page
+
+    def path_row(self, parent, title, initial, browse_command):
+        ctk.CTkLabel(parent, text=title, anchor="w", font=ctk.CTkFont(size=13, weight="bold")).pack(fill="x", padx=20, pady=(16, 3))
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=20)
+        entry = ctk.CTkEntry(row, height=36, font=("Segoe UI", self.current_font_size))
+        entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        entry.insert(0, initial)
+        button = ctk.CTkButton(row, text="Browse", width=90, height=36, command=browse_command)
+        button.pack(side="right")
+        return entry, button
+
+    def build_paths_page(self, parent, today_base_folder, default_stamp_path):
+        page = ctk.CTkFrame(parent, fg_color="transparent")
+        page.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(page, text="Paths", font=ctk.CTkFont(size=26, weight="bold")).grid(row=0, column=0, sticky="w", pady=(0, 12))
+        card = ctk.CTkFrame(page, corner_radius=12)
+        card.grid(row=1, column=0, sticky="ew")
+        self.verify_entry, self.btn_verify_src = self.path_row(card, "Verify source (Main folder with 'M' filenames)", os.path.join(today_base_folder, "Main"), self.select_verify_source)
+        self.source_entry, self.btn_src = self.path_row(card, "Source folder (Container List)", os.path.join(today_base_folder, "Container List"), self.select_source)
+        self.fixed_entry, self.btn_fx = self.path_row(card, "Stamp image (.png)", default_stamp_path, self.select_fixed_file)
+        self.output_entry, self.btn_out = self.path_row(card, "Output directory", os.path.join(today_base_folder, "BarcodeandStamp"), self.select_output)
+
+        actions = ctk.CTkFrame(card, fg_color="transparent")
+        actions.pack(fill="x", padx=20, pady=(18, 18))
+        self.auto_create_out_btn = ctk.CTkButton(actions, text="Create output folder", command=lambda: self.auto_create_barcode_stamp_folder(silent=False))
+        self.auto_create_out_btn.pack(side="left", padx=(0, 8))
+        self.open_folder_btn = ctk.CTkButton(actions, text="Open output folder", fg_color=("gray70", "gray30"), hover_color=("gray62", "gray38"), text_color=("gray10", "gray95"), command=self.open_current_output_folder)
+        self.open_folder_btn.pack(side="left")
+        return page
+
+    def build_drive_page(self, parent, today_base_folder):
+        page = ctk.CTkFrame(parent, fg_color="transparent")
+        page.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(page, text="Google Drive", font=ctk.CTkFont(size=26, weight="bold")).grid(row=0, column=0, sticky="w", pady=(0, 12))
+        card = ctk.CTkFrame(page, corner_radius=12)
+        card.grid(row=1, column=0, sticky="ew")
+        self.gdrive_src_entry, self.btn_gd_src = self.path_row(card, "Local date folder to mirror (switches to the new day automatically)", today_base_folder, self.select_gdrive_source)
+
+        actions = ctk.CTkFrame(card, fg_color="transparent")
+        actions.pack(fill="x", padx=20, pady=(18, 6))
+        self.auto_create_gdrive_btn = ctk.CTkButton(actions, text="Create Drive folders & log IDs", command=self.manual_create_gdrive_folders)
+        self.auto_create_gdrive_btn.pack(side="left", padx=(0, 20))
+        ctk.CTkLabel(actions, text="CSV re-check interval").pack(side="left", padx=(0, 8))
+        minus_btn = ctk.CTkButton(actions, text="−", width=36, height=34, font=ctk.CTkFont(size=18, weight="bold"))
+        self.sync_interval_lbl = ctk.CTkLabel(actions, text=f"{self.sync_interval} s", width=64, font=ctk.CTkFont(size=14, weight="bold"))
+        plus_btn = ctk.CTkButton(actions, text="+", width=36, height=34, font=ctk.CTkFont(size=18, weight="bold"))
+        for btn, delta in ((minus_btn, -1), (plus_btn, 1)):
+            # click = one step, hold = keeps stepping (no typing needed)
+            btn.bind("<ButtonPress-1>", lambda e, d=delta: self.start_interval_repeat(d))
+            btn.bind("<ButtonRelease-1>", self.stop_interval_repeat)
+        minus_btn.pack(side="left")
+        self.sync_interval_lbl.pack(side="left")
+        plus_btn.pack(side="left")
+
+        ctk.CTkLabel(card, justify="left", anchor="w", wraplength=760, text_color=("gray35", "gray65"),
+                     text="New images and files upload within about a second. CSV files (Report and others) are re-checked at the interval above "
+                          "and re-uploaded only when they changed. Every 10 minutes Drive is re-listed to repair anything deleted or changed there."
+                     ).pack(fill="x", padx=20, pady=(4, 18))
+        return page
+
+    # ---------------------------------------------------------------- UI helpers used by the logic
+    def set_toggle_ui(self, key, on):
+        """Reflect a running/stopped loop on its switch and header chip (safe to call from any thread)."""
+        def apply():
+            switch = self.switches.get(key)
+            if switch:
+                switch.select() if on else switch.deselect()
+            chip = self.chips.get(key)
+            if chip:
+                chip.configure(text_color=CHIP_ON if on else CHIP_OFF)
+        self.ui(apply)
+
+    def set_progress(self, done, total=None):
+        if total is not None:
+            self.progress_total = max(total, 1)
+        self.progress_bar.set(min(done / self.progress_total, 1.0))
+
+    def roll_over_date_folders(self):
+        """After midnight, move the date-based folder paths on to today's folder (custom paths are left alone)."""
+        try:
+            new_base = get_today_active_date_folder()
+            old_base = self.current_base_folder
+            if new_base != old_base:
+                for entry in (self.verify_entry, self.source_entry, self.output_entry, self.gdrive_src_entry):
+                    value = entry.get().strip()
+                    if value.startswith(old_base):
+                        entry.delete(0, tk.END)
+                        entry.insert(0, new_base + value[len(old_base):])
+                self.current_base_folder = new_base
+                self.log_box.insert(tk.END, f"New day detected - folders switched to: {new_base}\n")
+                self.log_box.see(tk.END)
+                self.update_output_file_count()
+        except Exception as e:
+            log_error_to_file(f"Date rollover error: {e}")
+        self.root.after(60000, self.roll_over_date_folders)
 
     def get_oauth_headers(self):
         creds = None
@@ -712,7 +853,8 @@ class BarcodeApp:
             "source_path": self.source_entry.get().strip(),
             "stamp_path": self.fixed_entry.get().strip(),
             "output_path": self.output_entry.get().strip(),
-            "gdrive_src": self.gdrive_src_entry.get().strip()
+            "gdrive_src": self.gdrive_src_entry.get().strip(),
+            "sync_interval": self.sync_interval
         }
         save_config(cfg)
 
@@ -775,15 +917,15 @@ class BarcodeApp:
         if not self.verify_mode_active:
             self.toggle_processing_mode_silent()
             self.verify_mode_active = True
-            self.mode_lbl.config(text="Current Mode: [ Verify Mode (Main 'M' Register Match Active) ]", fg="#2ecc71")
-            self.mode_toggle_btn.config(text=" 🔀 Switch to Container-Only Mode ", bg="#c0392b")
+            self.mode_lbl.configure(text="Mode: Verify (Main 'M' register match active)", text_color=MODE_VERIFY_COLOR)
+            self.mode_toggle_btn.configure(text="Switch to Container-Only Mode", fg_color="#c0392b", hover_color="#a93226")
             self.log_box.insert(tk.END, f"Verify Mode activated. Loaded {len(self.register_numbers_set)} register numbers from Main folder files containing 'M'.\n")
             self.log_box.see(tk.END)
         else:
             self.verify_mode_active = False
             self.register_numbers_set.clear()
-            self.mode_lbl.config(text="Current Mode: [ Container-Only Mode ]", fg="#e67e22")
-            self.mode_toggle_btn.config(text=" 🔀 Switch to Verify Mode ", bg="#2980b9")
+            self.mode_lbl.configure(text="Mode: Container-Only", text_color=MODE_CONTAINER_COLOR)
+            self.mode_toggle_btn.configure(text="Switch to Verify Mode", fg_color=ctk.ThemeManager.theme["CTkButton"]["fg_color"], hover_color=ctk.ThemeManager.theme["CTkButton"]["hover_color"])
             self.log_box.insert(tk.END, "Switched back to Container-Only Mode.\n")
             self.log_box.see(tk.END)
 
@@ -813,13 +955,13 @@ class BarcodeApp:
     def toggle_list_copy_loop(self):
         if not self.is_list_copy_looping:
             self.is_list_copy_looping = True
-            self.toggle_list_copy_btn.config(text=" ⏹️ Stop Auto-Copy (list_of_container) ", bg="#c0392b")
+            self.set_toggle_ui("list", True)
             self.log_box.insert(tk.END, "Auto-Copy loop for 'list_of_container' started...\n")
             self.log_box.see(tk.END)
             threading.Thread(target=self.list_copy_loop_worker, daemon=True).start()
         else:
             self.is_list_copy_looping = False
-            self.toggle_list_copy_btn.config(text=" 🚀 Start Auto-Copy (list_of_container) ", bg="#8e44ad")
+            self.set_toggle_ui("list", False)
             self.log_box.insert(tk.END, "Auto-Copy loop for 'list_of_container' stopped.\n")
             self.log_box.see(tk.END)
 
@@ -840,6 +982,13 @@ class BarcodeApp:
                         dest_file_path = os.path.join(target_list_dir, file_name)
                         
                         if os.path.isfile(src_file_path):
+                            try:
+                                dst_stat = os.stat(dest_file_path)
+                                src_stat = os.stat(src_file_path)
+                                if dst_stat.st_size == src_stat.st_size and int(dst_stat.st_mtime) == int(src_stat.st_mtime):
+                                    continue  # already copied and unchanged
+                            except OSError:
+                                pass
                             if is_file_ready(src_file_path):
                                 try:
                                     shutil.copy2(src_file_path, dest_file_path)
@@ -849,29 +998,74 @@ class BarcodeApp:
                 pass
             time.sleep(0.5)
 
+    def drive_request(self, method, url, headers, extra_headers=None, retries=5, **kwargs):
+        """Drive call with timeout, token refresh on 401 and backoff on rate-limit/5xx. None if the network keeps failing."""
+        kwargs.setdefault("timeout", 60)
+        res = None
+        for attempt in range(retries):
+            try:
+                res = requests.request(method, url, headers={**headers, **(extra_headers or {})}, **kwargs)
+            except requests.RequestException:
+                res = None
+                time.sleep(min(2 ** attempt, 20))
+                continue
+            if res.status_code == 401:
+                try:
+                    headers.update(self.get_oauth_headers())
+                except Exception as e:
+                    log_error_to_file(f"Token refresh failed: {e}")
+                continue
+            if res.status_code in (429, 500, 502, 503, 504) or (res.status_code == 403 and "ateLimit" in res.text):
+                time.sleep(min(2 ** attempt, 30))
+                continue
+            return res
+        return res
+
+    def save_index(self):
+        with self.index_lock:
+            save_gdrive_index(dict(self.gdrive_index_map))
+
     def get_or_create_folder_id(self, headers, parent_id, folder_name):
-        url = "https://www.googleapis.com/drive/v3/files"
-        params = {
-            "q": f"'{parent_id}' in parents and name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-            "pageSize": 1,
-            "fields": "files(id, name)",
-            "supportsAllDrives": True,
-            "includeItemsFromAllDrives": True
-        }
-        res = requests.get(url, headers=headers, params=params)
-        if res.status_code == 200:
-            files = res.json().get("files", [])
-            if files:
-                return files[0]["id"]
-        
-        meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
-        r_create = requests.post(url, headers=headers, json=meta, params={"supportsAllDrives": True})
-        if r_create.status_code == 200:
-            return r_create.json().get("id")
-        else:
-            err_str = f"API Error creating '{folder_name}' ({r_create.status_code}): {r_create.text}"
-            log_error_to_file(err_str)
-        return None
+        cache_key = f"folder_{parent_id}_{folder_name}"
+        files_url = "https://www.googleapis.com/drive/v3/files"
+        with gdrive_lock:
+            cached_id = self.gdrive_index_map.get(cache_key)
+            if cached_id and cached_id in self.verified_folder_ids:
+                return cached_id
+            if cached_id:
+                test_res = self.drive_request("GET", f"{files_url}/{cached_id}", headers, params={"supportsAllDrives": True, "fields": "id,trashed"})
+                if test_res is None or test_res.status_code not in (200, 404):
+                    return None  # cannot verify right now; creating a copy here would duplicate the folder
+                if test_res.status_code == 200 and not test_res.json().get("trashed", False):
+                    self.verified_folder_ids.add(cached_id)
+                    return cached_id
+
+            safe_name = folder_name.replace("\\", "\\\\").replace("'", "\\'")
+            params = {
+                "q": f"'{parent_id}' in parents and name = '{safe_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+                "pageSize": 5,
+                "fields": "files(id, name)",
+                "supportsAllDrives": True,
+                "includeItemsFromAllDrives": True
+            }
+            res = self.drive_request("GET", files_url, headers, params=params)
+            if res is None or res.status_code != 200:
+                return None
+            found = res.json().get("files", [])
+            if found:
+                fid = found[0]["id"]
+            else:
+                meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
+                r_create = self.drive_request("POST", files_url, headers, json=meta, params={"supportsAllDrives": True})
+                if r_create is None or r_create.status_code != 200:
+                    log_error_to_file(f"API Error creating '{folder_name}' ({getattr(r_create, 'status_code', 'no response')}): {getattr(r_create, 'text', '')}")
+                    return None
+                fid = r_create.json().get("id")
+            with self.index_lock:
+                self.gdrive_index_map[cache_key] = fid
+            self.verified_folder_ids.add(fid)
+            self.save_index()
+            return fid
 
     def log_folder_structure_to_sheet(self, date_label, sub_main_name, sub_main_id, subfolder_ids_map):
         token_path = "token.json"
@@ -954,198 +1148,328 @@ class BarcodeApp:
     def toggle_gdrive_folder_sync_loop(self):
         if not self.is_gdrive_folder_sync_looping:
             self.is_gdrive_folder_sync_looping = True
-            self.toggle_gdrive_folder_sync_btn.config(text=" ⏹️ Stop Auto-Sync CustomsDocs ", bg="#c0392b")
-            self.log_box.insert(tk.END, "Auto-Sync CustomsDocs loop started with manual time interval...\n")
+            self.set_toggle_ui("drive", True)
+            self.log_box.insert(tk.END, "Auto-Sync CustomsDocs loop started (Using Local Persistent Index Map)...\n")
             self.log_box.see(tk.END)
             threading.Thread(target=self.gdrive_folder_sync_loop_worker, daemon=True).start()
         else:
             self.is_gdrive_folder_sync_looping = False
-            self.toggle_gdrive_folder_sync_btn.config(text=" ☁️ Start Auto-Sync CustomsDocs ", bg="#8e44ad")
+            self.set_toggle_ui("drive", False)
             self.log_box.insert(tk.END, "Auto-Sync CustomsDocs loop stopped.\n")
             self.log_box.see(tk.END)
 
+    def ui(self, fn):
+        """Run fn on the Tk main thread (Tk widgets must not be touched from worker threads)."""
+        try:
+            self.root.after(0, fn)
+        except Exception:
+            pass
+
+    def ui_log(self, msg):
+        self.ui(lambda: (self.log_box.insert(tk.END, msg + "\n"), self.log_box.see(tk.END)))
+
+    def update_sync_status(self, stats):
+        try:
+            now = datetime.datetime.now().strftime("%H:%M:%S")
+            if stats["new"] or stats["updated"]:
+                self.last_upload_text = f"last upload {now} (new {stats['new']}, updated {stats['updated']})"
+            text = f"Drive sync: checked {now}   |   {self.last_upload_text}   |   failed (retrying): {stats['failed']}"
+            self.ui(lambda: self.sync_status_lbl.configure(text=text))
+        except Exception:
+            pass
+
+    def get_sync_interval(self):
+        return float(self.sync_interval)
+
+    def change_sync_interval(self, delta):
+        step = 5 if (self.sync_interval > SYNC_INTERVAL_FINE_MAX or (self.sync_interval == SYNC_INTERVAL_FINE_MAX and delta > 0)) else 1
+        self.sync_interval = max(SYNC_INTERVAL_MIN, min(SYNC_INTERVAL_MAX, self.sync_interval + delta * step))
+        self.sync_interval_lbl.configure(text=f"{self.sync_interval} s")
+
+    def start_interval_repeat(self, delta):
+        self.stop_interval_repeat()
+        self.change_sync_interval(delta)
+        self.interval_repeat_job = self.root.after(400, lambda: self.interval_repeat(delta))
+
+    def interval_repeat(self, delta):
+        self.change_sync_interval(delta)
+        self.interval_repeat_job = self.root.after(90, lambda: self.interval_repeat(delta))
+
+    def stop_interval_repeat(self, _event=None):
+        if self.interval_repeat_job:
+            self.root.after_cancel(self.interval_repeat_job)
+            self.interval_repeat_job = None
+            self.save_current_paths()
+
+    def prepare_gdrive_context(self):
+        """Resolve today's CustomsDocs folder + subfolder ids once and reuse them until the date changes."""
+        target_path = self.gdrive_src_entry.get().strip()
+        if not os.path.exists(target_path):
+            return None
+        now = time.time()
+        if not self.gd_headers or now - self.gd_headers_time > 1200:
+            self.gd_headers.update(self.get_oauth_headers())
+            self.gd_headers_time = now
+
+        folder_base_name = os.path.basename(os.path.normpath(target_path))
+        date_match = re.search(r'(\d{2}-\w{3}-\d{4})', folder_base_name)
+        date_str = date_match.group(1) if date_match else datetime.datetime.now().strftime("%d-%b-%Y")
+        c_name = f"CustomsDocs_{date_str}"
+
+        ctx = self.gd_ctx
+        if not ctx or ctx["c_name"] != c_name:
+            gdrive_folder_id = self.get_or_create_folder_id(self.gd_headers, TARGET_PARENT_FOLDER_ID, c_name)
+            if not gdrive_folder_id:
+                return None
+            sub_map = {}
+            for sub in GDRIVE_SUBFOLDERS:
+                sub_id = self.get_or_create_folder_id(self.gd_headers, gdrive_folder_id, sub)
+                if sub_id:
+                    sub_map[sub] = sub_id
+            if len(sub_map) < len(GDRIVE_SUBFOLDERS):
+                return None
+            self.log_folder_structure_to_sheet(date_str, c_name, gdrive_folder_id, sub_map)
+            ctx = self.gd_ctx = {"c_name": c_name, "id": gdrive_folder_id, "map": sub_map}
+        return target_path, ctx["id"], ctx["map"], self.gd_headers
+
+    def reconcile_with_drive(self):
+        """Forget cached signatures so the next pass re-lists Drive and repairs anything deleted or changed there."""
+        with self.sync_lock:
+            with self.index_lock:
+                for key in [k for k in self.gdrive_index_map if k.startswith("sig_")]:
+                    del self.gdrive_index_map[key]
+            with self.children_lock:
+                self.drive_children.clear()
+
     def gdrive_folder_sync_loop_worker(self):
+        # Images/other files are mirrored on every tick; CSVs (Report etc.) are re-checked every "Report Interval" seconds.
+        last_csv_pass = 0.0
+        last_reconcile = time.time()
         while self.is_gdrive_folder_sync_looping:
             try:
-                try:
-                    interval = float(self.sync_interval_entry.get().strip())
-                    if interval <= 0:
-                        interval = 10.0
-                except:
-                    interval = 10.0
-
-                target_path = self.gdrive_src_entry.get().strip()
-                parent_id = TARGET_PARENT_FOLDER_ID
-                
-                if not os.path.exists(target_path):
-                    time.sleep(5)
-                    continue
-
-                headers = self.get_oauth_headers()
-                folder_base_name = os.path.basename(os.path.normpath(target_path))
-                date_match = re.search(r'(\d{2}-\w{3}-\d{4})', folder_base_name)
-                date_str = date_match.group(1) if date_match else datetime.datetime.now().strftime("%d-%b-%Y")
-
-                c_name = f"CustomsDocs_{date_str}"
-                gdrive_folder_id = self.get_or_create_folder_id(headers, parent_id, c_name)
-                if gdrive_folder_id:
-                    subfolder_id_map = {}
-                    for sub in ["BarCodeAndStamp", "Container List", "Container Match Format (VGM)", "Main", "Part", "Report"]:
-                        if not self.is_gdrive_folder_sync_looping:
-                            break
-                        sub_id = self.get_or_create_folder_id(headers, gdrive_folder_id, sub)
-                        if sub_id:
-                            subfolder_ids_map[sub] = sub_id
-
-                    self.log_folder_structure_to_sheet(date_str, c_name, gdrive_folder_id, subfolder_ids_map)
-                    self.sync_folder_by_id(target_path, gdrive_folder_id, subfolder_ids_map, headers)
-                
-                elapsed = 0.0
-                while elapsed < interval and self.is_gdrive_folder_sync_looping:
-                    time.sleep(0.5)
-                    elapsed += 0.5
+                if time.time() - last_reconcile >= RECONCILE_SECONDS:
+                    self.reconcile_with_drive()
+                    last_reconcile = time.time()
+                ctx = self.prepare_gdrive_context()
+                if ctx:
+                    target_path, gdrive_folder_id, sub_map, headers = ctx
+                    include_csv = time.time() - last_csv_pass >= self.get_sync_interval()
+                    stats = self.sync_folder_by_id(target_path, gdrive_folder_id, sub_map, headers, include_csv=include_csv)
+                    if include_csv:
+                        last_csv_pass = time.time()
+                    if stats["new"] or stats["updated"] or stats["failed"]:
+                        self.ui_log(f"[GDrive Sync] new: {stats['new']} | updated: {stats['updated']} | failed (will retry): {stats['failed']} | unchanged: {stats['unchanged']}")
             except Exception as e:
                 log_error_to_file(f"GDrive Sync Loop Error: {e}")
                 time.sleep(2)
+            for _ in range(4):
+                if not self.is_gdrive_folder_sync_looping:
+                    break
+                time.sleep(0.25)
 
-    def sync_folder_by_id(self, local_dir, root_gdrive_id, subfolder_id_map, headers):
-        try:
-            folder_name = os.path.basename(os.path.normpath(local_dir)).lower()
-            
-            # STRICT TARGETING: ONLY Report folder and Container List check continuously. 
-            # All other folders (Main, Part, BarCodeAndStamp, etc.) skip existing files instantly for maximum speed!
-            is_report_or_list_folder = ("report" in folder_name) or ("container list" in folder_name)
+    def resolve_top_level_id(self, folder_name, subfolder_id_map):
+        """Map a local top-level folder to its Drive subfolder, ignoring case and known renames."""
+        key = folder_name.strip().lower()
+        key = GDRIVE_FOLDER_ALIASES.get(key, key)
+        for name, fid in subfolder_id_map.items():
+            if name.lower() == key:
+                return fid
+        return None
 
-            existing_gdrive_files = {}
+    def get_drive_children(self, headers, folder_id):
+        """Non-folder files already on Drive in folder_id, keyed by lower-case name (listed once per session)."""
+        with self.children_lock:
+            cached = self.drive_children.get(folder_id)
+            if cached is not None:
+                return cached
+            children = {}
+            page_token = None
+            while True:
+                params = {
+                    "q": f"'{folder_id}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'",
+                    "fields": "nextPageToken, files(id, name, size, md5Checksum)",
+                    "pageSize": 1000,
+                    "supportsAllDrives": True,
+                    "includeItemsFromAllDrives": True
+                }
+                if page_token:
+                    params["pageToken"] = page_token
+                res = self.drive_request("GET", "https://www.googleapis.com/drive/v3/files", headers, params=params)
+                if res is None or res.status_code != 200:
+                    return None
+                data = res.json()
+                for f in data.get("files", []):
+                    children.setdefault(f["name"].strip().lower(), f)
+                page_token = data.get("nextPageToken")
+                if not page_token:
+                    break
+            self.drive_children[folder_id] = children
+            return children
+
+    def read_file_bytes(self, path):
+        for _ in range(5):
             try:
-                page_token = None
-                while True:
-                    list_url = "https://www.googleapis.com/drive/v3/files"
-                    params = {
-                        "q": f"'{root_gdrive_id}' in parents and trashed = false",
-                        "fields": "nextPageToken, files(id, name)",
-                        "supportsAllDrives": True,
-                        "includeItemsFromAllDrives": True,
-                        "pageSize": 1000
-                    }
-                    if page_token:
-                        params["pageToken"] = page_token
+                with open(path, 'rb') as f:
+                    return f.read()
+            except FileNotFoundError:
+                return None
+            except OSError:
+                time.sleep(0.3)
+        return None
 
-                    res = requests.get(list_url, headers=headers, params=params)
-                    if res.status_code == 200:
-                        data = res.json()
-                        for f in data.get("files", []):
-                            existing_gdrive_files[f["name"].strip().lower()] = f.get("id")
-                        page_token = data.get("nextPageToken")
-                        if not page_token:
-                            break
-                    else:
-                        break
-            except Exception:
-                pass
+    def collect_sync_jobs(self, local_dir, root_gdrive_id, subfolder_id_map, headers, include_csv):
+        """Walk the local tree, creating missing Drive folders, and return (path, name, drive_parent_id, is_csv) jobs."""
+        jobs = []
+        dir_ids = {local_dir: root_gdrive_id}
+        for dirpath, dirnames, filenames in os.walk(local_dir):
+            pid = dir_ids[dirpath]
+            for d in list(dirnames):
+                sub_id = self.resolve_top_level_id(d, subfolder_id_map) if dirpath == local_dir else None
+                if not sub_id:
+                    sub_id = self.get_or_create_folder_id(headers, pid, d)
+                if sub_id:
+                    dir_ids[os.path.join(dirpath, d)] = sub_id
+                else:
+                    dirnames.remove(d)  # folder could not be created now; retried next pass
+            for f in filenames:
+                if f.endswith(".sync_snapshot.tmp"):
+                    continue
+                is_csv = f.lower().endswith(".csv")
+                if is_csv and not include_csv:
+                    continue
+                jobs.append((os.path.join(dirpath, f), f, pid, is_csv))
+        jobs.sort(key=lambda j: not j[3])  # CSVs first so reports are never queued behind thousands of images
+        return jobs
 
-            if not os.path.exists(local_dir):
-                return
-            items = os.listdir(local_dir)
-            
-            def upload_single_item(item):
-                local_item_path = os.path.join(local_dir, item)
-                target_pid = subfolder_id_map.get(item, root_gdrive_id)
-                
-                if os.path.isdir(local_item_path):
-                    sub_id = subfolder_id_map.get(item)
-                    if not sub_id:
-                        sub_id = self.get_or_create_folder_id(headers, root_gdrive_id, item)
-                    
-                    if sub_id:
-                        sub_map = {item: sub_id}
-                        self.sync_folder_by_id(local_item_path, sub_id, sub_map, headers)
-                
-                elif os.path.isfile(local_item_path):
-                    clean_item = item.strip().lower()
+    def sync_one_file(self, path, name, pid, is_csv, headers):
+        """Make one Drive file identical to the local one. Returns new/updated/unchanged/skipped/failed."""
+        if self.retry_after.get(path, 0) > time.time():
+            return "skipped"
+        try:
+            st = os.stat(path)
+        except OSError:
+            return "skipped"
+        sig = f"{st.st_size}:{st.st_mtime_ns}"
+        clean = name.strip().lower()
+        id_key = f"file_{pid}_{clean}"
+        sig_key = f"sig_{pid}_{clean}"
 
+        with self.index_lock:
+            file_id = self.gdrive_index_map.get(id_key)
+            old_sig = self.gdrive_index_map.get(sig_key)
+        if file_id and old_sig == sig:
+            return "unchanged"
+        if not is_csv and time.time() - st.st_mtime < 1.5:
+            return "skipped"  # still being written; picked up on the next pass
+
+        def remember(fid):
+            with self.index_lock:
+                self.gdrive_index_map[id_key] = fid
+                self.gdrive_index_map[sig_key] = sig
+                self.index_dirty = True
+
+        content = None
+        children = None
+        if not file_id or old_sig is None:
+            children = self.get_drive_children(headers, pid)
+            if children is None:
+                return "failed"
+            remote = children.get(clean)
+            file_id = remote["id"] if remote else None  # live listing wins over a stale index entry
+            if remote:
+                if is_csv:
+                    content = self.read_file_bytes(path)
+                    same = content is not None and remote.get("md5Checksum") == hashlib.md5(content).hexdigest()
+                else:
+                    same = remote.get("size") == str(st.st_size)
+                if same:
+                    remember(file_id)
+                    return "unchanged"
+
+        if content is None:
+            content = self.read_file_bytes(path)
+        if content is None:
+            if not os.path.exists(path):
+                return "skipped"
+            self.retry_after[path] = time.time() + 60
+            log_error_to_file(f"Could not read for upload (locked?): {path}")
+            return "failed"
+
+        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        result = "updated" if file_id else "new"
+
+        if file_id:
+            # Drive rejects a 'parents' field on update, so send only the content.
+            res = self.drive_request("PATCH", f"https://www.googleapis.com/upload/drive/v3/files/{file_id}", headers,
+                                     extra_headers={"Content-Type": mime}, params={"uploadType": "media", "supportsAllDrives": "true"}, data=content)
+            if res is not None and res.status_code == 404:
+                file_id = None
+                result = "new"
+            elif res is None or res.status_code != 200:
+                self.retry_after[path] = time.time() + 60
+                log_error_to_file(f"Drive update failed for {path}: {getattr(res, 'status_code', 'no response')} {getattr(res, 'text', '')[:300]}")
+                return "failed"
+
+        if not file_id:
+            boundary = 'foo_bar_baz'
+            metadata_part = json.dumps({"name": name, "parents": [pid]})
+            body = (
+                f"--{boundary}\r\n"
+                f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+                f"{metadata_part}\r\n"
+                f"--{boundary}\r\n"
+                f"Content-Type: {mime}\r\n\r\n"
+            ).encode('utf-8') + content + f"\r\n--{boundary}--".encode('utf-8')
+            res = self.drive_request("POST", "https://www.googleapis.com/upload/drive/v3/files", headers,
+                                     extra_headers={"Content-Type": f"multipart/related; boundary={boundary}"},
+                                     params={"uploadType": "multipart", "supportsAllDrives": "true"}, data=body)
+            if res is None or res.status_code != 200:
+                self.retry_after[path] = time.time() + 60
+                log_error_to_file(f"Drive create failed for {path}: {getattr(res, 'status_code', 'no response')} {getattr(res, 'text', '')[:300]}")
+                return "failed"
+            file_id = res.json().get("id")
+            if children is not None:
+                children[clean] = {"id": file_id, "name": name}
+
+        remember(file_id)
+        self.retry_after.pop(path, None)
+        return result
+
+    def sync_folder_by_id(self, local_dir, root_gdrive_id, subfolder_id_map, headers, include_csv=True):
+        """Mirror local_dir onto Drive. Only new/changed files are uploaded; failures are retried on the next pass."""
+        stats = {"new": 0, "updated": 0, "unchanged": 0, "skipped": 0, "failed": 0}
+        with self.sync_lock:
+            try:
+                if not os.path.isdir(local_dir):
+                    return stats
+                jobs = self.collect_sync_jobs(local_dir, root_gdrive_id, subfolder_id_map, headers, include_csv)
+                stats_lock = threading.Lock()
+
+                def run(job):
+                    path, name, pid, is_csv = job
                     try:
-                        file_id = existing_gdrive_files.get(clean_item)
-
-                        # FAST SPEED OPTIMIZATION: If it's an image/PDF folder (Main, Part, etc.) and already exists on Google Drive, skip instantly!
-                        if not is_report_or_list_folder and file_id:
-                            return
-
-                        read_path = local_item_path
-                        temp_shadow_path = None
-                        if is_report_or_list_folder:
-                            try:
-                                temp_shadow_path = local_item_path + ".tmp_sync_force"
-                                shutil.copy2(local_item_path, temp_shadow_path)
-                                read_path = temp_shadow_path
-                            except Exception:
-                                read_path = local_item_path
-
-                        file_content = b""
-                        for _ in range(5):
-                            try:
-                                with open(read_path, 'rb') as f:
-                                    file_content = f.read()
-                                if file_content:
-                                    break
-                            except Exception:
-                                time.sleep(0.2)
-
-                        if temp_shadow_path and os.path.exists(temp_shadow_path):
-                            try:
-                                os.remove(temp_shadow_path)
-                            except:
-                                pass
-
-                        if not file_content:
-                            return
-
-                        boundary = 'foo_bar_baz'
-                        headers_mp = {"Authorization": headers["Authorization"], "Content-Type": f"multipart/related; boundary={boundary}"}
-                        metadata_part = json.dumps({"name": item, "parents": [target_pid]})
-                        body = (
-                            f"--{boundary}\r\n"
-                            f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
-                            f"{metadata_part}\r\n"
-                            f"--{boundary}\r\n"
-                            f"Content-Type: application/octet-stream\r\n\r\n"
-                        ).encode('utf-8') + file_content + f"\r\n--{boundary}--".encode('utf-8')
-                        
-                        if file_id:
-                            update_url = f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=multipart&supportsAllDrives=true"
-                            for attempt in range(3):
-                                upload_res = requests.patch(update_url, headers=headers_mp, data=body)
-                                if upload_res.status_code == 200:
-                                    break
-                                elif upload_res.status_code == 403:
-                                    time.sleep(2.0 * (attempt + 1))
-                                else:
-                                    break
-                        else:
-                            create_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true"
-                            for attempt in range(3):
-                                upload_res = requests.post(create_url, headers=headers_mp, data=body)
-                                if upload_res.status_code == 200:
-                                    existing_gdrive_files[clean_item] = upload_res.json().get("id")
-                                    break
-                                elif upload_res.status_code == 403:
-                                    time.sleep(2.0 * (attempt + 1))
-                                else:
-                                    break
-                        time.sleep(0.05)
+                        result = self.sync_one_file(path, name, pid, is_csv, headers)
                     except Exception as e:
-                        log_error_to_file(f"Upload/Update exception on {item}: {e}")
+                        log_error_to_file(f"Upload/Update exception on {path}: {e}")
+                        result = "failed"
+                    with stats_lock:
+                        stats[result] += 1
 
-            worker_count = 1 if is_report_or_list_folder else 6
-            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-                executor.map(upload_single_item, items)
-
-        except Exception as e:
-            log_error_to_file(f"Sync error on {local_dir}: {e}")
-
+                with concurrent.futures.ThreadPoolExecutor(max_workers=SYNC_WORKERS) as executor:
+                    list(executor.map(run, jobs))
+                if self.index_dirty:
+                    self.index_dirty = False
+                    self.save_index()
+                self.update_sync_status(stats)
+            except Exception as e:
+                log_error_to_file(f"Sync error on {local_dir}: {e}")
+        return stats
+ 
     def update_stats_display(self):
-        stats_text = f" 📊 Session Stats — Processed: {self.count_processed}   |   Already Stamped: {self.count_already_stamped}   |   Errors: {self.count_errors}   |   Files Move: {self.count_files_move} "
-        self.stats_lbl.config(text=stats_text)
+        values = {"processed": self.count_processed, "stamped": self.count_already_stamped, "errors": self.count_errors, "files": self.count_files_move}
+        for key, value in values.items():
+            self.stat_labels[key].configure(text=f"{value:,}")
+        self.stat_labels["errors"].configure(text_color="#e5484d" if self.count_errors else ("gray10", "gray90"))
 
     def jump_to_error_log(self):
         log_content = self.log_box.get("1.0", tk.END)
@@ -1164,17 +1488,11 @@ class BarcodeApp:
     def toggle_expand_log(self):
         self.is_log_expanded = not self.is_log_expanded
         if self.is_log_expanded:
-            self.src_card.pack_forget()
-            self.stamp_card.pack_forget()
-            self.out_card.pack_forget()
-            self.expand_log_btn.config(text=" 📜 Restore View ", bg="#7f8c8d")
-            self.log_box.config(height=32)
+            self.top_area.grid_remove()
+            self.expand_log_btn.configure(text="Restore view")
         else:
-            self.src_card.pack(fill=tk.X, pady=(0, 12))
-            self.stamp_card.pack(fill=tk.X, pady=(0, 12))
-            self.out_card.pack(fill=tk.X, pady=(0, 12))
-            self.expand_log_btn.config(text=" 📜 Expand Log ", bg="#34495e")
-            self.log_box.config(height=10)
+            self.top_area.grid()
+            self.expand_log_btn.configure(text="Expand log")
 
     def auto_create_barcode_stamp_folder(self, silent=True):
         target_dir = self.output_entry.get().strip()
@@ -1196,7 +1514,7 @@ class BarcodeApp:
         self.seen_containers.clear()
         self.first_seen_files.clear()
         self.processed_source_files.clear()
-        self.progress_bar["value"] = 0
+        self.set_progress(0, 1)
         self.update_output_file_count()
         self.log_box.delete("1.0", tk.END)
         self.log_box.insert(tk.END, "Log cleared and stats reset.\n")
@@ -1231,6 +1549,7 @@ class BarcodeApp:
             source = self.source_entry.get().strip()
             if not source or not target_output_dir:
                 messagebox.showerror("Missing Information", "Please specify Source folder and Output directory.")
+                self.set_toggle_ui("watch", False)
                 return
             
             os.makedirs(target_output_dir, exist_ok=True)
@@ -1238,8 +1557,7 @@ class BarcodeApp:
             self.session_output_dir = target_output_dir
             
             self.is_watching = True
-            self.status_canvas.itemconfig(self.status_circle, fill="#e74c3c")
-            self.watch_btn.config(text="Stop Auto-Watch Mode", bg="#c0392b")
+            self.set_toggle_ui("watch", True)
             self.log_box.insert(tk.END, f"Auto-Watch started. Output: {self.session_output_dir}\n")
             self.log_box.see(tk.END)
             
@@ -1247,8 +1565,7 @@ class BarcodeApp:
             threading.Thread(target=self.watch_folder_loop, daemon=True).start()
         else:
             self.is_watching = False
-            self.status_canvas.itemconfig(self.status_circle, fill="#27ae60")
-            self.watch_btn.config(text="Start Auto-Watch & Process", bg="#27ae60")
+            self.set_toggle_ui("watch", False)
             self.log_box.insert(tk.END, f"Auto-Watch mode stopped.\n")
             self.log_box.see(tk.END)
 
@@ -1258,19 +1575,20 @@ class BarcodeApp:
 
         while self.is_watching:
             try:
+                source_dir = self.source_entry.get().strip()  # re-read so a date rollover is picked up
+                self.session_output_dir = self.output_entry.get().strip() or self.session_output_dir
                 self.toggle_processing_mode_silent()
                 if os.path.exists(source_dir):
                     os.makedirs(self.session_output_dir, exist_ok=True)
                     all_files = [f for f in os.listdir(source_dir) if os.path.isfile(os.path.join(source_dir, f))]
                     
-                    valid_files = [f for f in all_files if f not in self.processed_source_files and "@" in f]
-                    other_files = [f for f in all_files if f not in self.processed_source_files and "@" not in f]
+                    valid_files = [f for f in all_files if f not in self.processed_source_files and self.file_retry_after.get(f, 0) <= time.time() and "@" in f]
+                    other_files = [f for f in all_files if f not in self.processed_source_files and self.file_retry_after.get(f, 0) <= time.time() and "@" not in f]
                     container_files = valid_files + other_files
                     
                     if container_files:
                         total_files_batch = len(container_files)
-                        self.progress_bar["maximum"] = total_files_batch
-                        self.progress_bar["value"] = 0
+                        self.ui(lambda n=total_files_batch: self.set_progress(0, n))
 
                         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
                             futures = {
@@ -1280,8 +1598,11 @@ class BarcodeApp:
                             completed_count = 0
                             for future in concurrent.futures.as_completed(futures):
                                 file_name = futures[future]
-                                self.processed_source_files.add(file_name)
                                 res_status, result_msg = future.result()
+                                if res_status == "retry":
+                                    self.file_retry_after[file_name] = time.time() + 30
+                                else:
+                                    self.processed_source_files.add(file_name)
                                 if res_status in ["processed", "duplicate_container"]:
                                     self.count_processed += 1
                                     if res_status == "processed":
@@ -1289,11 +1610,10 @@ class BarcodeApp:
                                 elif res_status == "error":
                                     self.count_errors += 1
                                 if result_msg:
-                                    self.log_box.insert(tk.END, result_msg + "\n")
-                                    self.log_box.see(tk.END)
+                                    self.ui_log(result_msg)
                                 completed_count += 1
-                                self.progress_bar["value"] = completed_count
-                                self.update_output_file_count()
+                                self.ui(lambda v=completed_count: self.set_progress(v))
+                                self.ui(self.update_output_file_count)
             except Exception as e:
                 log_error_to_file(f"Watch folder loop error: {e}")
             time.sleep(0.5)
@@ -1304,12 +1624,13 @@ class BarcodeApp:
             source = self.source_entry.get().strip()
             if not source or not target_output_dir:
                 messagebox.showerror("Error", "Please specify Source folder and Output directory.")
+                self.set_toggle_ui("copy", False)
                 return
 
             os.makedirs(target_output_dir, exist_ok=True)
             self.session_output_dir = target_output_dir
             self.is_copy_processing = True
-            self.process_copy_btn.config(text="Stop Auto-Copy & Process", bg="#c0392b")
+            self.set_toggle_ui("copy", True)
             self.log_box.insert(tk.END, f"Auto-Copy & Process started (Keep Source). Output: {target_output_dir}\n")
             self.log_box.see(tk.END)
 
@@ -1317,7 +1638,7 @@ class BarcodeApp:
             threading.Thread(target=self.copy_processing_loop_worker, daemon=True).start()
         else:
             self.is_copy_processing = False
-            self.process_copy_btn.config(text="Start Auto-Copy & Process (Keep Source)", bg="#d35400")
+            self.set_toggle_ui("copy", False)
             self.log_box.insert(tk.END, f"Auto-Copy & Process stopped.\n")
             self.log_box.see(tk.END)
 
@@ -1327,19 +1648,20 @@ class BarcodeApp:
 
         while self.is_copy_processing:
             try:
+                source_dir = self.source_entry.get().strip()  # re-read so a date rollover is picked up
+                self.session_output_dir = self.output_entry.get().strip() or self.session_output_dir
                 self.toggle_processing_mode_silent()
                 if os.path.exists(source_dir):
                     os.makedirs(self.session_output_dir, exist_ok=True)
                     all_files = [f for f in os.listdir(source_dir) if os.path.isfile(os.path.join(source_dir, f))]
                     
-                    valid_files = [f for f in all_files if f not in self.processed_source_files and "@" in f]
-                    other_files = [f for f in all_files if f not in self.processed_source_files and "@" not in f]
+                    valid_files = [f for f in all_files if f not in self.processed_source_files and self.file_retry_after.get(f, 0) <= time.time() and "@" in f]
+                    other_files = [f for f in all_files if f not in self.processed_source_files and self.file_retry_after.get(f, 0) <= time.time() and "@" not in f]
                     container_files = valid_files + other_files
                     
                     if container_files:
                         total_files_batch = len(container_files)
-                        self.progress_bar["maximum"] = total_files_batch
-                        self.progress_bar["value"] = 0
+                        self.ui(lambda n=total_files_batch: self.set_progress(0, n))
 
                         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
                             futures = {
@@ -1349,8 +1671,11 @@ class BarcodeApp:
                             completed_count = 0
                             for future in concurrent.futures.as_completed(futures):
                                 file_name = futures[future]
-                                self.processed_source_files.add(file_name)
                                 res_status, result_msg = future.result()
+                                if res_status == "retry":
+                                    self.file_retry_after[file_name] = time.time() + 30
+                                else:
+                                    self.processed_source_files.add(file_name)
                                 if res_status in ["processed", "duplicate_container"]:
                                     self.count_processed += 1
                                     if res_status == "processed":
@@ -1358,11 +1683,10 @@ class BarcodeApp:
                                 elif res_status == "error":
                                     self.count_errors += 1
                                 if result_msg:
-                                    self.log_box.insert(tk.END, result_msg + "\n")
-                                    self.log_box.see(tk.END)
+                                    self.ui_log(result_msg)
                                 completed_count += 1
-                                self.progress_bar["value"] = completed_count
-                                self.update_output_file_count()
+                                self.ui(lambda v=completed_count: self.set_progress(v))
+                                self.ui(self.update_output_file_count)
             except Exception as e:
                 log_error_to_file(f"Copy loop error: {e}")
             time.sleep(0.5)
@@ -1378,16 +1702,14 @@ class BarcodeApp:
             self.update_font_sizes()
 
     def update_font_sizes(self):
-        f_norm = ("Arial", self.current_font_size)
+        f_norm = ("Segoe UI", self.current_font_size)
         f_log = ("Consolas", self.current_font_size)
         for ent in [self.source_entry, self.fixed_entry, self.output_entry, self.verify_entry, self.gdrive_src_entry]:
-            ent.config(font=f_norm)
-        for btn in [self.btn_src, self.btn_fx, self.btn_out, self.btn_verify_src, self.btn_gd_src]:
-            btn.config(font=f_norm)
-        self.log_box.config(font=f_log)
+            ent.configure(font=f_norm)
+        self.log_box.configure(font=f_log)
 
 def run_fully_automatic_startup(app_instance):
-    app_instance.run_full_automated_sequence()
+    threading.Thread(target=app_instance.run_full_automated_sequence, daemon=True).start()
     
     def trigger_loops():
         if not app_instance.is_watching:
@@ -1398,8 +1720,7 @@ def run_fully_automatic_startup(app_instance):
                 os.makedirs(os.path.join(target_output_dir, "Error_Files"), exist_ok=True)
                 app_instance.session_output_dir = target_output_dir
                 app_instance.is_watching = True
-                app_instance.status_canvas.itemconfig(app_instance.status_circle, fill="#e74c3c")
-                app_instance.watch_btn.config(text="Stop Auto-Watch Mode", bg="#c0392b")
+                app_instance.set_toggle_ui("watch", True)
                 app_instance.log_box.insert(tk.END, f"Auto-Watch started. Output: {app_instance.session_output_dir}\n")
                 app_instance.log_box.see(tk.END)
                 app_instance.toggle_processing_mode_silent()
@@ -1407,24 +1728,22 @@ def run_fully_automatic_startup(app_instance):
 
         if not app_instance.is_list_copy_looping:
             app_instance.is_list_copy_looping = True
-            app_instance.toggle_list_copy_btn.config(text=" ⏹️ Stop Auto-Copy (list_of_container) ", bg="#c0392b")
+            app_instance.set_toggle_ui("list", True)
             app_instance.log_box.insert(tk.END, "Auto-Copy loop for 'list_of_container' started...\n")
             app_instance.log_box.see(tk.END)
             threading.Thread(target=app_instance.list_copy_loop_worker, daemon=True).start()
 
         if not app_instance.is_gdrive_folder_sync_looping:
             app_instance.is_gdrive_folder_sync_looping = True
-            app_instance.toggle_gdrive_folder_sync_btn.config(text=" ⏹️ Stop Auto-Sync CustomsDocs ", bg="#c0392b")
+            app_instance.set_toggle_ui("drive", True)
             app_instance.log_box.insert(tk.END, "Auto-Sync CustomsDocs loop started...\n")
             app_instance.log_box.see(tk.END)
             threading.Thread(target=app_instance.gdrive_folder_sync_loop_worker, daemon=True).start()
 
     app_instance.root.after(100, trigger_loops)
-    #hgyhgfvhy
-    #jhbghjn
 
 if __name__ == "__main__":
-    root = tk.Tk()
+    root = ctk.CTk()
     app = BarcodeApp(root)
     threading.Thread(target=run_fully_automatic_startup, args=(app,), daemon=True).start()
     root.mainloop()
